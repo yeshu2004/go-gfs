@@ -1,0 +1,7 @@
+go.mod
+bin
+
+temp/storage/4001/*
+temp/storage/4002/*
+temp/storage/4003/*
+temp/storage/4004/*
