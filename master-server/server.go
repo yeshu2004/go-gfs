@@ -25,9 +25,6 @@ type MasterServer struct {
 
 // type Master struct {
 //     fileToChunks   map[string][]ChunkID
-//     chunkLocations map[ChunkID][]string
-//     heartbeats     map[string]time.Time
-//     mu             sync.RWMutex
 // }
 
 func NewMasterServer(listenAddr string) *MasterServer {
@@ -90,6 +87,7 @@ func (m *MasterServer) heartBeatsHandler(rw http.ResponseWriter, req *http.Reque
 	m.heartbeats[string(pl.ServerID)] = time.Now()
 	m.mu.Unlock()
 
+	log.Printf("heartbeat recived - server (%s) is ALIVE with disk space: %d", pl.ServerID, pl.DiskSpace);
 	rw.WriteHeader(http.StatusOK)
 }
 

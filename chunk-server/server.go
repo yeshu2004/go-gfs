@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/yeshu2004/gfs/models"
 )
@@ -22,9 +23,9 @@ type ChunkServer struct {
 	storageDir string
 }
 
-func newRegisterPayload(id, addr string, disk int64)* models.RegisterPayload{
+func newRegisterPayload(id, addr string, disk int64) *models.RegisterPayload {
 	return &models.RegisterPayload{
-		ID: id,
+		ID:   id,
 		Addr: addr,
 		Disk: disk,
 	}
@@ -44,9 +45,10 @@ func NewChunkServer(serverID string, listenAddr string, masterAddr string, disks
 }
 
 func (c *ChunkServer) RunServer() {
-	if err := c.registerWithMaster(); err != nil{
+	if err := c.registerWithMaster(); err != nil {
 		log.Fatalln(err)
 	}
+	c.runHeartBeatCycle();
 
 	mux := http.NewServeMux()
 
@@ -60,8 +62,19 @@ func (c *ChunkServer) RunServer() {
 	}
 }
 
+func (c *ChunkServer) runHeartBeatCycle() {
+	ticker := time.NewTicker(5 * time.Second)
+
+	for range ticker.C {
+		spaceAvail := c.disk - c.used
+		if err := sendHeartBeat(c.masterAddr, c.id, spaceAvail); err != nil {
+			log.Printf("(%s) server failed to send heartbeat, err: %v\n", c.id, err)
+		}
+	}
+}
+
 func (c *ChunkServer) registerWithMaster() error {
-	payload := newRegisterPayload(c.id, c.listenAddr, c.disk);
+	payload := newRegisterPayload(c.id, c.listenAddr, c.disk)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -69,20 +82,39 @@ func (c *ChunkServer) registerWithMaster() error {
 	}
 
 	url := fmt.Sprintf("http://%s/register", c.masterAddr)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body));
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK{
-		b, err := io.ReadAll(resp.Body);
-		if err != nil{
+	if resp.StatusCode != http.StatusOK {
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
 			return fmt.Errorf("(%s): error in reading the register response: %v", c.id, err)
 		}
 		return fmt.Errorf("(%s): registration failed: %s", c.id, string(b))
-	} 
+	}
 
 	log.Printf("(%s): chunk server registered with master", c.id)
-	return nil;
+	return nil
+}
+
+func sendHeartBeat(masterServerAddr, serverID string, spaceAvailable int64) error {
+	hb := models.HeartBeat{
+		ServerID:  models.ServerID(serverID),
+		DiskSpace: spaceAvailable,
+	}
+	pl, err := json.Marshal(hb)
+	if err != nil {
+		return err
+	}
+
+	client := http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	url := fmt.Sprintf("http://%s/heartbeat", masterServerAddr)
+	_, err = client.Post(url, "application/json", bytes.NewBuffer(pl))
+	return err
 }
