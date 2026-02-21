@@ -22,7 +22,7 @@ func main() {
 	var disksize int64 = 1_000_000_000
 	for i, addr := range chunkServerAddr{
 		go func (addr string)  {
-			chunkServerID := fmt.Sprintf("chunk-server-%d", i+1)
+			chunkServerID := fmt.Sprintf("CS%d", i+1)
 			csr := cs.NewChunkServer(chunkServerID, addr, masterListenAddr, disksize);
 			csr.RunServer();
 		}(addr);

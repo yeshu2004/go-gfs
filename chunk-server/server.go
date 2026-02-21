@@ -48,7 +48,7 @@ func (c *ChunkServer) RunServer() {
 	if err := c.registerWithMaster(); err != nil {
 		log.Fatalln(err)
 	}
-	c.runHeartBeatCycle();
+	c.runHeartBeatCycle()
 
 	mux := http.NewServeMux()
 
@@ -66,8 +66,7 @@ func (c *ChunkServer) runHeartBeatCycle() {
 	ticker := time.NewTicker(5 * time.Second)
 
 	for range ticker.C {
-		spaceAvail := c.disk - c.used
-		if err := sendHeartBeat(c.masterAddr, c.id, spaceAvail); err != nil {
+		if err := sendHeartBeat(c.masterAddr, c.id, c.disk, c.used); err != nil {
 			log.Printf("(%s) server failed to send heartbeat, err: %v\n", c.id, err)
 		}
 	}
@@ -100,10 +99,15 @@ func (c *ChunkServer) registerWithMaster() error {
 	return nil
 }
 
-func sendHeartBeat(masterServerAddr, serverID string, spaceAvailable int64) error {
+func sendHeartBeat(masterServerAddr, serverID string, diskSpace, diskUsed int64 ) error {
+	// uncomment below for testing dead server validation
+	// if serverID == "chunk-server-1"{
+	// 	return nil;
+	// }
 	hb := models.HeartBeat{
 		ServerID:  models.ServerID(serverID),
-		DiskSpace: spaceAvailable,
+		TotalDiskSpace: diskSpace,
+		DiskUsed: diskUsed ,
 	}
 	pl, err := json.Marshal(hb)
 	if err != nil {

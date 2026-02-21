@@ -11,7 +11,8 @@ type RegisterPayload struct {
 
 type HeartBeat struct{
 	ServerID ServerID
-	DiskSpace int64
+	TotalDiskSpace int64
+	DiskUsed int64
 }
 
 type ChunkID string
