@@ -108,7 +108,9 @@ func (m *MasterServer) fileMappingHandler(rw http.ResponseWriter, r *http.Reques
 	selectedServer := eligibleServers[:ReplicationFactor]
 
 	// 4. genrate chunkID
-	chunkId := uuid.New().String()
+	// have to look for better small id bcz uuid are 128 bit,
+	// paper suggests for 64 bit bcz for memory efficiency
+	chunkId := uuid.New().String(); 
 
 	// 4. substract the available space for those server for now
 	for _, server := range selectedServer {
