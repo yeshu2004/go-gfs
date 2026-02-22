@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,13 +20,13 @@ import (
 const (
 	syncInterval  = 200 * time.Millisecond
 	segmentPrefix = "segment-"
-	maxFileSize   = 64 * 1024 * 1024
+	maxFileSize   = 64 * 1024 * 1024 // chunk size
 )
 
 type WAL_Entry struct {
-	SequenceNo uint64
-	Data       []byte
-	CRC        uint32 // checksum for corruption detection
+	SequenceNo uint64 `protobuf:"varint,1,opt,name=sequence_no,json=sequenceNo,proto3" json:"sequence_no,omitempty"`
+	Data       []byte `protobuf:"bytes,2,opt,name=data,proto3"                          json:"data,omitempty"`
+	CRC        uint32 `protobuf:"varint,3,opt,name=crc,proto3"                          json:"crc,omitempty"`
 }
 
 type WAL struct {
@@ -45,44 +45,46 @@ type WAL struct {
 }
 
 func OpenWAL(dir string, shouldFsync bool) (*WAL, error) {
-	// 1. create a dir / open a dir
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
 
-	// read the log segement
 	files, err := filepath.Glob(filepath.Join(dir, segmentPrefix+"*"))
 	if err != nil {
 		return nil, err
 	}
 
 	lastSegmentID := 0
+	var lastSequenceNo uint64
+
 	if len(files) > 0 {
-		// find the last segmentID
 		lastSegmentID, err = findLastSegmentFileIndex(files)
 		if err != nil {
 			return nil, err
 		}
+
+		// recover lastSequenceNo by scanning all segments in order.
+		lastSequenceNo, err = recoverLastSequenceIndex(dir, files)
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		// if log segement doesn't exists, create new one
+		// no segments yet, create the initial one.
 		file, err := createSegmentFile(dir, lastSegmentID)
 		if err != nil {
 			return nil, err
 		}
-
 		if err := file.Close(); err != nil {
 			return nil, err
 		}
 	}
 
-	// open the last log segment file
 	filePath := filepath.Join(dir, fmt.Sprintf("%s%d", segmentPrefix, lastSegmentID))
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	// go to the end of the file for append only nature
 	if _, err := file.Seek(0, io.SeekEnd); err != nil {
 		return nil, err
 	}
@@ -92,11 +94,11 @@ func OpenWAL(dir string, shouldFsync bool) (*WAL, error) {
 	wal := &WAL{
 		directory:           dir,
 		currentSegment:      file,
-		lastSequenceNo:      0,
+		lastSequenceNo:      lastSequenceNo,
 		bufWriter:           bufio.NewWriter(file),
 		syncTimer:           time.NewTimer(syncInterval),
-		shouldFsync:         shouldFsync, // true or false
-		maxFileSize:         maxFileSize, // chunk size i.e. 64MB
+		shouldFsync:         shouldFsync,
+		maxFileSize:         maxFileSize,
 		maxSegments:         10,
 		currentSegmentIndex: lastSegmentID,
 		ctx:                 ctx,
@@ -108,11 +110,11 @@ func OpenWAL(dir string, shouldFsync bool) (*WAL, error) {
 	return wal, nil
 }
 
+// Write appends data to the WAL and returns any error.
 func (w *WAL) Write(data []byte) error {
 	return w.writeEntry(data)
 }
 
-// main logic behind write from backend client
 func (w *WAL) writeEntry(data []byte) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
@@ -125,17 +127,17 @@ func (w *WAL) writeEntry(data []byte) error {
 	entry := &WAL_Entry{
 		SequenceNo: w.lastSequenceNo,
 		Data:       data,
-		CRC:        crc32.ChecksumIEEE(append(data, byte(w.lastSequenceNo))),
+		CRC:        computeCRC(data, w.lastSequenceNo),
 	}
 
-	marshedEntry := MustMarshal(entry)
-	size := int32(len(marshedEntry))
+	marshaledEntry := MustMarshal(entry)
 
+	size := int32(len(marshaledEntry))
 	if err := binary.Write(w.bufWriter, binary.LittleEndian, size); err != nil {
 		return err
 	}
 
-	_, err := w.bufWriter.Write(marshedEntry)
+	_, err := w.bufWriter.Write(marshaledEntry)
 	return err
 }
 
@@ -146,30 +148,26 @@ func (w *WAL) rotateLogIfNeeded() error {
 	}
 
 	if fileInfo.Size()+int64(w.bufWriter.Buffered()) >= w.maxFileSize {
-		// rotate log
-		if err := w.rotateLog(); err != nil {
-			return err
-		}
+		return w.rotateLog()
 	}
 
 	return nil
 }
 
 func (w *WAL) rotateLog() error {
-	// first sync all data
 	if err := w.sync(); err != nil {
 		return err
 	}
 
 	if err := w.currentSegment.Close(); err != nil {
-		return err
+		return err 
 	}
 
 	w.currentSegmentIndex++
-	if w.currentSegmentIndex >= w.maxSegments {
-		// delete old one
+
+	if w.currentSegmentIndex > w.maxSegments {
 		if err := w.deleteOldSegment(); err != nil {
-			return err
+			return err 
 		}
 	}
 
@@ -189,41 +187,99 @@ func (w *WAL) deleteOldSegment() error {
 		return err
 	}
 
-	var oldestSegmentFile string
-	if len(files) > 0 {
-		// find oldest segment file path
-		oldestSegmentFile, err = w.findOldestSegmentFile(files)
-		if err != nil {
-			return err
-		}
-	} else {
+	if len(files) == 0 {
 		return nil
 	}
 
-	if err := os.Remove(oldestSegmentFile); err != nil {
+	oldestSegmentFile, err := w.findOldestSegmentFile(files)
+	if err != nil {
 		return err
 	}
 
-	return nil
+	return os.Remove(oldestSegmentFile)
 }
 
 func (w *WAL) ReadAll() ([]*WAL_Entry, error) {
-	file, err := os.OpenFile(w.currentSegment.Name(), os.O_RDONLY, 0644)
+	files, err := filepath.Glob(filepath.Join(w.directory, segmentPrefix+"*"))
 	if err != nil {
 		return nil, err
 	}
 
-	entries, _, err := readEntriesFromFile(file)
-	if err != nil {
-		return nil, err
+	// sort by segment index so entries are returned in write order.
+	sortSegmentFiles(files, w.directory)
+
+	var allEntries []*WAL_Entry
+	for _, path := range files {
+		f, err := os.OpenFile(path, os.O_RDONLY, 0644)
+		if err != nil {
+			return nil, err
+		}
+
+		entries, _, err := readEntrieFromFile(f)
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		allEntries = append(allEntries, entries...)
 	}
 
-	return entries, nil
+	return allEntries, nil
 }
 
-func readEntriesFromFile(file *os.File) ([]*WAL_Entry, uint64, error) {
+
+func (w *WAL) syncLoop() {
+	ticker := time.NewTicker(syncInterval)
+	for {
+		select {
+		case <-ticker.C:
+			w.lock.Lock()
+			err := w.sync()
+			w.lock.Unlock()
+
+			if err != nil {
+				log.Printf("error while performing sync: %v", err)
+				w.syncTimer.Reset(syncInterval)
+			}
+
+		case <-w.ctx.Done():
+			return
+		}
+	}
+}
+
+func (w *WAL) sync() error {
+	if err := w.bufWriter.Flush(); err != nil {
+		return err
+	}
+	if w.shouldFsync {
+		if err := w.currentSegment.Sync(); err != nil {
+			return err
+		}
+	}
+	w.syncTimer.Reset(syncInterval)
+	return nil
+}
+
+// Close flushes and syncs the WAL then releases all resources.
+func (w *WAL) Close() error {
+	w.cancel()
+
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	if err := w.sync(); err != nil {
+		return err
+	}
+
+	return w.currentSegment.Close()
+}
+
+// readEntrieFromFile reads all entries from a single segment file.
+func readEntrieFromFile(file *os.File) ([]*WAL_Entry, uint64, error) {
 	var entries []*WAL_Entry
 	checkpointLogSequenceNo := uint64(0)
+
 	for {
 		var size int32
 		if err := binary.Read(file, binary.LittleEndian, &size); err != nil {
@@ -234,21 +290,58 @@ func readEntriesFromFile(file *os.File) ([]*WAL_Entry, uint64, error) {
 		}
 
 		data := make([]byte, size)
-		n, err := io.ReadFull(file, data)
-		if err != nil {
+		if _, err := io.ReadFull(file, data); err != nil {
 			return nil, checkpointLogSequenceNo, err
 		}
-		log.Printf("read (%d) bytes from the segement file - %v", n, file)
 
 		entry, err := UnmarshalAndVerifyCheckSum(data)
 		if err != nil {
 			return nil, checkpointLogSequenceNo, err
 		}
+
 		checkpointLogSequenceNo = entry.SequenceNo
 		entries = append(entries, entry)
 	}
 
 	return entries, checkpointLogSequenceNo, nil
+}
+
+// recoverLastSequenceNo scans all segment files in order and returns
+// the highest sequence number found.
+// called once during OpenWAL so that the WAL resumes from where it left 
+// off after a restart.
+func recoverLastSequenceIndex(dir string, files []string) (uint64, error) {
+	sortSegmentFiles(files, dir)
+
+	var lastSeq uint64
+	for _, path := range files {
+		f, err := os.OpenFile(path, os.O_RDONLY, 0644)
+		if err != nil {
+			return 0, err
+		}
+
+		_, seq, err := readEntrieFromFile(f)
+		f.Close()
+		if err != nil {
+			return 0, err
+		}
+
+		if seq > lastSeq {
+			lastSeq = seq
+		}
+	}
+
+	return lastSeq, nil
+}
+
+// sortSegmentFiles sorts file paths by their numeric segment index in
+// ascending order so that entries are processed in write order.
+func sortSegmentFiles(files []string, dir string) {
+	sort.Slice(files, func(i, j int) bool {
+		idxI, _ := strconv.Atoi(strings.TrimPrefix(filepath.Base(files[i]), segmentPrefix))
+		idxJ, _ := strconv.Atoi(strings.TrimPrefix(filepath.Base(files[j]), segmentPrefix))
+		return idxI < idxJ
+	})
 }
 
 func (w *WAL) findOldestSegmentFile(files []string) (string, error) {
@@ -270,50 +363,20 @@ func (w *WAL) findOldestSegmentFile(files []string) (string, error) {
 	return oldestSegmentPath, nil
 }
 
-func (w *WAL) syncLoop() {
-	for {
-		select {
-		case <-w.syncTimer.C:
-			w.lock.Lock()
-			err := w.sync()
-			w.lock.Unlock()
-
-			if err != nil {
-				log.Printf("error while performing sync: %v", err)
-			}
-		case <-w.ctx.Done():
-			return
-		}
-	}
-}
-
-func (w *WAL) sync() error {
-	if err := w.bufWriter.Flush(); err != nil {
-		return err
-	}
-	if w.shouldFsync {
-		if err := w.currentSegment.Sync(); err != nil {
-			return err
-		}
-	}
-	w.syncTimer.Reset(syncInterval) // reset the keep syncing timer
-	return nil
-}
-
 func findLastSegmentFileIndex(files []string) (int, error) {
-	var lastSegementID int
+	var lastSegmentID int
 	for _, file := range files {
 		_, fileName := filepath.Split(file)
 		segmentID, err := strconv.Atoi(strings.TrimPrefix(fileName, segmentPrefix))
 		if err != nil {
 			return 0, err
 		}
-		if segmentID > lastSegementID {
-			lastSegementID = segmentID
+		if segmentID > lastSegmentID {
+			lastSegmentID = segmentID
 		}
 	}
 
-	return lastSegementID, nil
+	return lastSegmentID, nil
 }
 
 func createSegmentFile(dir string, segmentID int) (*os.File, error) {

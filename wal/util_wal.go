@@ -1,36 +1,33 @@
 package wal
 
 import (
+	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"log"
 
 	"github.com/gogo/protobuf/proto"
 )
 
-// ProtoMessage implements [proto.Message].
-func (w *WAL_Entry) ProtoMessage() {
-	panic("unimplemented")
-}
 
-// Reset implements [proto.Message].
+// ProtoMessage implements [proto.Message]. It is a marker method.
+func (w *WAL_Entry) ProtoMessage() {}
+
+// Reset implements [proto.Message]. It zeroes the entry.
 func (w *WAL_Entry) Reset() {
-	panic("unimplemented")
+	*w = WAL_Entry{}
 }
 
 // String implements [proto.Message].
 func (w *WAL_Entry) String() string {
-	panic("unimplemented")
+	return proto.CompactTextString(w)
 }
 
-
-func MustMarshal(entry *WAL_Entry) []byte{
-	marshalEntry, err := proto.Marshal(entry);
-	if err != nil{
-		log.Printf("proto marshal error: %v", err);
-		return nil;
+func MustMarshal(entry *WAL_Entry) []byte {
+	data, err := proto.Marshal(entry)
+	if err != nil {
+		panic(fmt.Sprintf("proto marshal error: %v", err))
 	}
-	return marshalEntry;
+	return data
 }
 
 func MustUnmarshal(buff []byte, entry *WAL_Entry) error {
@@ -45,15 +42,19 @@ func UnmarshalAndVerifyCheckSum(data []byte) (*WAL_Entry, error){
 		return nil, err;
 	}
 
-	if !vefiryCRC(&entry){
+	if !verifyCRC(&entry){
 		return nil, fmt.Errorf("CRC mismatch: data may be corrupted")
 	}
 
 	return &entry, nil;
 }
 
-func vefiryCRC(entry *WAL_Entry) bool{
-	actualCRC := crc32.ChecksumIEEE(append(entry.Data, byte(entry.SequenceNo)))
+func computeCRC(data []byte, sequenceNo uint64) uint32 {
+	seqBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(seqBytes, sequenceNo)
+	return crc32.ChecksumIEEE(append(data, seqBytes...))
+}
 
-	return actualCRC == entry.CRC;
+func verifyCRC(entry *WAL_Entry) bool {
+	return computeCRC(entry.Data, entry.SequenceNo) == entry.CRC
 }
