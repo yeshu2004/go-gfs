@@ -10,7 +10,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
 	"github.com/yeshu2004/gfs/models"
 )
 
@@ -34,6 +33,8 @@ func newRegisterPayload(id, addr string, disk int64) *models.RegisterPayload {
 func NewChunkServer(serverID string, listenAddr string, masterAddr string, disksize int64) *ChunkServer {
 	port := strings.TrimPrefix(listenAddr, ":")
 	dir := fmt.Sprintf("temp/storage/%s", port)
+	log.Println(dir)
+
 	return &ChunkServer{
 		id:         serverID,
 		listenAddr: listenAddr,
@@ -45,21 +46,61 @@ func NewChunkServer(serverID string, listenAddr string, masterAddr string, disks
 }
 
 func (c *ChunkServer) RunServer() {
-	if err := c.registerWithMaster(); err != nil {
-		log.Fatalln(err)
-	}
-	c.runHeartBeatCycle()
-
-	mux := http.NewServeMux()
-
 	if err := os.MkdirAll(c.storageDir, os.ModePerm); err != nil {
 		log.Println(err.Error())
 	}
+
+	if err := c.registerWithMaster(); err != nil {
+		log.Fatalln(err)
+	}
+	go c.runHeartBeatCycle()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload/{chunk_id}", c.uploadChunkToServerHandler)
 
 	log.Printf("chunk server about to listen on %s", c.listenAddr)
 	if err := http.ListenAndServe(c.listenAddr, mux); err != nil {
 		log.Printf("(%s) server error: %v", c.listenAddr, err)
 	}
+}
+
+func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		rw.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	chunkID := r.PathValue("chunk_id")
+	if chunkID == "" {
+		http.Error(rw, "missing chunk id", http.StatusBadRequest)
+		return
+	}
+	log.Println("Requested chunk on Replica Server :", chunkID)
+
+	// check if the chunkId is valid or not, if not return err
+	// if yes, then ask the replicas from the primary
+	masterNodeUrl := fmt.Sprintf("http://%s/chunk-info/%s", c.masterAddr, chunkID)
+	resp, err := http.Get(masterNodeUrl);
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		http.Error(rw, "master returned error", resp.StatusCode)
+		return
+	}
+
+	var vaildInfo models.VerfiyChunkResp;
+	if err := json.NewDecoder(resp.Body).Decode(&vaildInfo); err != nil{
+		http.Error(rw, "chunk decoding error", http.StatusInternalServerError);
+		return
+	};
+
+
+	log.Printf("ChunkId: %v, Replicas: %v", vaildInfo.ChunkID, vaildInfo.Replicas);
+	rw.WriteHeader(http.StatusOK)
 }
 
 func (c *ChunkServer) runHeartBeatCycle() {
@@ -99,15 +140,15 @@ func (c *ChunkServer) registerWithMaster() error {
 	return nil
 }
 
-func sendHeartBeat(masterServerAddr, serverID string, diskSpace, diskUsed int64 ) error {
+func sendHeartBeat(masterServerAddr, serverID string, diskSpace, diskUsed int64) error {
 	// uncomment below for testing dead server validation
 	// if serverID == "chunk-server-1"{
 	// 	return nil;
 	// }
 	hb := models.HeartBeat{
-		ServerID:  models.ServerID(serverID),
+		ServerID:       models.ServerID(serverID),
 		TotalDiskSpace: diskSpace,
-		DiskUsed: diskUsed ,
+		DiskUsed:       diskUsed,
 	}
 	pl, err := json.Marshal(hb)
 	if err != nil {

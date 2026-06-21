@@ -8,25 +8,32 @@ import (
 	ms "github.com/yeshu2004/gfs/master-server"
 )
 
-func main() {
-	masterListenAddr := ":8000"
-	msr := ms.NewMasterServer(masterListenAddr)
+var (
+	MasterServerAddr = ":8000"
+	ChunkServerAddr = []string{":4001", ":4002", ":4003", ":4004"}
+	ServerDiskSpace = 1_000_000_000
+)
 
+
+func newGfsSever(masterNodeAddr string,  chunkServersAddr []string, diskSpace int64){
+	msn := ms.NewMasterServer(masterNodeAddr);
 	go func() {
-		if err := msr.RunServer(); err != nil {
+		if err := msn.RunServer(); err != nil {
 			log.Fatalln(err)
 		}
 	}()
 
-	chunkServerAddr := []string{":4001", ":4002", ":4003", ":4004"}
-	var disksize int64 = 1_000_000_000
-	for i, addr := range chunkServerAddr{
+
+	for i, addr := range chunkServersAddr{
 		go func (addr string)  {
 			chunkServerID := fmt.Sprintf("CS%d", i+1)
-			csr := cs.NewChunkServer(chunkServerID, addr, masterListenAddr, disksize);
+			csr := cs.NewChunkServer(chunkServerID, addr, masterNodeAddr, diskSpace);
 			csr.RunServer();
 		}(addr);
 	}
+}
 
-	select{}
+func main() {
+	newGfsSever(MasterServerAddr, ChunkServerAddr, int64(ServerDiskSpace));
+	select{};	
 }

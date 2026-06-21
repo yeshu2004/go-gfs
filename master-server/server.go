@@ -25,6 +25,12 @@ type ChunkMeta struct {
 	ReservedDisk int64 // logical reservations from master
 }
 
+type PendingChunk struct {
+	ChunkID  models.ChunkID
+	Primary  models.ServerID
+	Replicas []models.ServerID
+}
+
 type MasterServer struct {
 	listenAddr string
 	heartbeats map[models.ServerID]time.Time
@@ -32,8 +38,8 @@ type MasterServer struct {
 	mu         sync.RWMutex
 
 	fileToChunks  map[string][]models.ChunkID
-	pendingChunks map[models.ChunkID][]models.ServerID // temprory state
-	chunkToServer map[models.ChunkID][]models.ServerID // update: after commit to disk
+	pendingChunks map[models.ChunkID]PendingChunk   // temprory state
+	chunkToServer map[models.ChunkID][]PendingChunk // update: after commit to disk
 }
 
 func NewMasterServer(listenAddr string) *MasterServer {
@@ -42,8 +48,8 @@ func NewMasterServer(listenAddr string) *MasterServer {
 		heartbeats:    make(map[models.ServerID]time.Time),
 		chunkMeta:     make(map[models.ServerID]ChunkMeta),
 		fileToChunks:  make(map[string][]models.ChunkID),
-		pendingChunks: make(map[models.ChunkID][]models.ServerID),
-		chunkToServer: make(map[models.ChunkID][]models.ServerID),
+		pendingChunks: make(map[models.ChunkID]PendingChunk),
+		chunkToServer: make(map[models.ChunkID][]PendingChunk),
 	}
 }
 
@@ -52,7 +58,8 @@ func (m *MasterServer) RunServer() error {
 
 	mux.HandleFunc("/register", m.registerChunkServerHandler) // WORKING
 	mux.HandleFunc("/heartbeat", m.heartBeatsHandler)         // WORKING
-	mux.HandleFunc("/chunk-server", m.fileMappingHandler)     // WORKING
+	mux.HandleFunc("/chunk-server", m.allocateChunkHandler)   // WORKING
+	mux.HandleFunc("/chunk-info/{chunk_id}", m.verfiyAndChunkInfoHandler)
 
 	go m.monitorHeartbeats()
 
@@ -60,9 +67,36 @@ func (m *MasterServer) RunServer() error {
 	return http.ListenAndServe(m.listenAddr, mux)
 }
 
+func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http.Request) {
+	chunkID := r.PathValue("chunk_id")
+	if chunkID == "" {
+		http.Error(rw, "missing chunk id", http.StatusBadRequest)
+		return
+	}
+	log.Println("Requested chunk on Maaster Server :", chunkID)
+
+	chunk, ok := m.pendingChunks[models.ChunkID(chunkID)]
+	log.Printf("Exists? %v", ok)
+	if !ok {
+		http.Error(rw, "chunk not found", http.StatusNotFound)
+		return
+	}
+
+	if len(chunk.Replicas) == 0 {
+		http.Error(rw, fmt.Sprintf("%s doesn't have any replicas or is not registered with us...", chunkID), http.StatusBadRequest)
+	}
+
+	json.NewEncoder(rw).Encode(models.VerfiyChunkResp{
+		ChunkID:  chunk.ChunkID,
+		Replicas: chunk.Replicas,
+	})
+}
+
 // TODO: to figure out fix when same file name exists for two diffent files
-func (m *MasterServer) fileMappingHandler(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+// api which response to the client about the chunks available to upload the file
+// response []chunk_serversID
+func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(rw, fmt.Sprintf("%v not allowed", r.Method), http.StatusMethodNotAllowed)
 		return
 	}
@@ -97,7 +131,7 @@ func (m *MasterServer) fileMappingHandler(rw http.ResponseWriter, r *http.Reques
 	}
 
 	if len(eligibleServers) < ReplicationFactor {
-		http.Error(rw, "not enough servers with space", http.StatusServiceUnavailable)
+		http.Error(rw, fmt.Sprintf("not enough servers with space, as replication factor: Elibigle Server (%d) - Replcation Factor (%d)\n", len(eligibleServers), ReplicationFactor), http.StatusServiceUnavailable)
 		return
 	}
 
@@ -105,12 +139,12 @@ func (m *MasterServer) fileMappingHandler(rw http.ResponseWriter, r *http.Reques
 	rand.Shuffle(len(eligibleServers), func(i, j int) {
 		eligibleServers[i], eligibleServers[j] = eligibleServers[j], eligibleServers[i]
 	})
-	selectedServer := eligibleServers[:ReplicationFactor]
+	selectedServer := eligibleServers[:ReplicationFactor] // quoram gaurentee
 
 	// 4. genrate chunkID
 	// have to look for better small id bcz uuid are 128 bit,
 	// paper suggests for 64 bit bcz for memory efficiency
-	chunkId := uuid.New().String(); 
+	chunkId := uuid.New().String()
 
 	// 4. substract the available space for those server for now
 	for _, server := range selectedServer {
@@ -121,21 +155,32 @@ func (m *MasterServer) fileMappingHandler(rw http.ResponseWriter, r *http.Reques
 
 	// 5. update fileToChunks & chunkToServer
 	m.fileToChunks[pl.FileName] = append(m.fileToChunks[pl.FileName], models.ChunkID(chunkId))
-	if _, exists := m.pendingChunks[models.ChunkID(chunkId)]; !exists {
-		m.pendingChunks[models.ChunkID(chunkId)] = []models.ServerID{}
+	m.pendingChunks[models.ChunkID(chunkId)] = PendingChunk{
+		ChunkID:  models.ChunkID(chunkId),
+		Primary:  selectedServer[0],
+		Replicas: selectedServer[1:],
 	}
-	m.pendingChunks[models.ChunkID(chunkId)] = selectedServer
 
-	type respBody struct {
-		ChunkID models.ChunkID    `json:"chunk_id"`
-		Servers []models.ServerID `json:"servers"`
+	log.Printf("Added pending chunk: %s\n", chunkId)
+	log.Printf("Current pending map: %+v\n", m.pendingChunks)
+
+	type AllocateChunkResponse struct {
+		ChunkID     models.ChunkID    `json:"chunk_id"`
+		Primary     models.ServerID   `json:"primary_server"`
+		Replicas    []models.ServerID `json:"replica_servers"`
+		PrimaryAddr string            `json:"primary_addr"`
 	}
+
+	primaryServer := selectedServer[0]
+	primaryAddr := m.chunkMeta[primaryServer].Addr
 
 	// 6. retrun back the chunkID & servers to client
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(respBody{
-		ChunkID: models.ChunkID(chunkId),
-		Servers: selectedServer,
+	json.NewEncoder(rw).Encode(AllocateChunkResponse{
+		ChunkID:     models.ChunkID(chunkId),
+		Primary:     primaryServer,
+		Replicas:    selectedServer[1:],
+		PrimaryAddr: primaryAddr,
 	})
 }
 
@@ -191,8 +236,26 @@ func (m *MasterServer) heartBeatsHandler(rw http.ResponseWriter, req *http.Reque
 // TODO: will be done....
 // Updates ChunkToServer map from pendingChunk Map & deletes the entry
 // from pendingChunk Map
-func (m *MasterServer) PendingChunkToServerCommit() {
-}
+
+// type WriteChunkRequest struct {
+// 	ChunkID  models.ChunkID `json:"chunk_id"`
+// 	Data     []byte `json:"data_byte"`
+// 	Replicas []models.ServerID `json:""`
+// }
+
+// func (m *MasterServer) uploadChunkToServerCommit(rw http.ResponseWriter, req *http.Request) {
+// 	if req.Method != http.MethodPost {
+// 		rw.WriteHeader(http.StatusMethodNotAllowed)
+// 		return
+// 	}
+
+// 	chunkreq := WriteChunkRequest{}
+// 	if err := json.NewDecoder(req.Body).Decode(&chunkreq); err != nil{
+// 		rw.WriteHeader(http.StatusBadRequest)
+// 		return
+// 	}
+
+// }
 
 func (m *MasterServer) monitorHeartbeats() {
 	ticker := time.NewTicker(10 * time.Second)
