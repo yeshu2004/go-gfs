@@ -233,30 +233,6 @@ func (m *MasterServer) heartBeatsHandler(rw http.ResponseWriter, req *http.Reque
 	rw.WriteHeader(http.StatusOK)
 }
 
-// TODO: will be done....
-// Updates ChunkToServer map from pendingChunk Map & deletes the entry
-// from pendingChunk Map
-
-// type WriteChunkRequest struct {
-// 	ChunkID  models.ChunkID `json:"chunk_id"`
-// 	Data     []byte `json:"data_byte"`
-// 	Replicas []models.ServerID `json:""`
-// }
-
-// func (m *MasterServer) uploadChunkToServerCommit(rw http.ResponseWriter, req *http.Request) {
-// 	if req.Method != http.MethodPost {
-// 		rw.WriteHeader(http.StatusMethodNotAllowed)
-// 		return
-// 	}
-
-// 	chunkreq := WriteChunkRequest{}
-// 	if err := json.NewDecoder(req.Body).Decode(&chunkreq); err != nil{
-// 		rw.WriteHeader(http.StatusBadRequest)
-// 		return
-// 	}
-
-// }
-
 func (m *MasterServer) monitorHeartbeats() {
 	ticker := time.NewTicker(10 * time.Second)
 
