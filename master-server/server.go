@@ -84,11 +84,26 @@ func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http
 
 	if len(chunk.Replicas) == 0 {
 		http.Error(rw, fmt.Sprintf("%s doesn't have any replicas or is not registered with us...", chunkID), http.StatusBadRequest)
+		return
 	}
 
+
+	m.mu.RLock()
+	replicaAddrs := make(map[models.ServerID]string, len(chunk.Replicas))
+	for _, id := range chunk.Replicas {
+		if meta, ok := m.chunkMeta[id]; ok {
+			replicaAddrs[id] = meta.Addr
+		} else {
+			log.Printf("verfiyAndChunkInfoHandler: no addr found for replica %s", id)
+		}
+	}
+	m.mu.RUnlock()
+
+	rw.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(rw).Encode(models.VerfiyChunkResp{
-		ChunkID:  chunk.ChunkID,
-		Replicas: chunk.Replicas,
+		ChunkID:      chunk.ChunkID,
+		Replicas:     chunk.Replicas,
+		ReplicaAddrs: replicaAddrs,
 	})
 }
 
