@@ -9,10 +9,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yeshu2004/gfs/models"
@@ -33,7 +35,7 @@ type ChunkServer struct {
 	listenAddr string
 	masterAddr string
 	disk       int64
-	used       int64
+	used       atomic.Int64
 	storageDir string
 }
 
@@ -55,7 +57,7 @@ func NewChunkServer(serverID string, listenAddr string, masterAddr string, disks
 		listenAddr: listenAddr,
 		disk:       disksize,
 		masterAddr: masterAddr,
-		used:       0,
+		used:       atomic.Int64{},
 		storageDir: dir,
 	}
 }
@@ -79,6 +81,8 @@ func (c *ChunkServer) RunServer() {
 		log.Printf("(%s) server error: %v", c.listenAddr, err)
 	}
 }
+
+// --------------- HTTP HANDLER ---------------------
 
 func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -171,9 +175,18 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 		http.Error(rw, "failed to copy file contents", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("copied file (%v) from client\n", fileHeader.Filename)
 
-	if err := replicateChunk(dstPath, string(vaildInfo.ChunkID), vaildInfo.ReplicaAddrs); err != nil {
+	fileInfo , err := os.Stat(dstPath);
+	if err != nil{
+		http.Error(rw, "failed to get describing the named file.", http.StatusInternalServerError)
+		return
+	}
+	fileSize := fileInfo.Size();
+	c.used.Add(fileSize);
+
+	log.Printf("copied file (%v), size (%d) from client\n", fileHeader.Filename, fileSize);
+
+	if err := replicateChunk(dstPath, string(vaildInfo.ChunkID), vaildInfo.ReplicaAddrs, ext); err != nil {
 		log.Printf("replication chunk error: %v\n", err)
 		// NOTE: chunk is saved locally but replication failed.
 		// Returning 500 here lets the client know to retry or alert.
@@ -181,9 +194,23 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 		return
 	}
 
+	// update the master state.....
+	res, err := http.Post(fmt.Sprintf("http://%s/update_file_metadata/{%s}", c.masterAddr, chunkID),"application/json; charset=utf-8", nil);
+
+	if err != nil{
+		http.Error(rw, fmt.Sprintf("error in updating file chunk metadata: %v", err), http.StatusInternalServerError);
+		return;
+	}
+
+	if res.StatusCode != http.StatusOK{
+		http.Error(rw, "status code error in updating file chunk metadata", http.StatusInternalServerError);
+		return;
+	}
+
 	rw.WriteHeader(http.StatusCreated)
 	fmt.Fprintf(rw, "Video successfully uploaded and saved: %s", fileHeader.Filename)
 }
+
 
 func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Request) {
 	chunkID := r.PathValue("chunk_id")
@@ -192,8 +219,12 @@ func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	fileType := r.URL.Query().Get("type")
+	chunkID = fmt.Sprintf("%s.%s", chunkID, fileType);
+
 	dstPath := filepath.Join(c.storageDir, chunkID)
 	f, err := os.Create(dstPath)
+
 	if err != nil {
 		log.Printf("replicateChunkHandler: failed to create file %s: %v", dstPath, err)
 		http.Error(rw, "failed to create chunk file", http.StatusInternalServerError)
@@ -208,15 +239,26 @@ func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	log.Printf("(%s) - copied the file: %s on the server (%s)", r.RemoteAddr, chunkID, c.listenAddr);
+	fileInfo, err := f.Stat();
+	if err != nil{
+		http.Error(rw, "failed to get describing the named file.", http.StatusInternalServerError)
+		return
+	}
+	fileSize := fileInfo.Size();
+	c.used.Add(fileSize);
+	log.Printf("%s - disk size updated....", c.listenAddr);
 
-	// update the master state.....
+	log.Printf("(%s) - copied the file: %s on the server (%s)", r.RemoteAddr, chunkID, c.listenAddr);
 	rw.WriteHeader(http.StatusOK)
 }
 
+
+// ---------------- HELPER FUNCTION -----------------------------
+
+
 // replicateChunk fans out the chunk at dstPath to all replica servers in parallel.
 // it returns a joined error if any replica fails after all retries.
-func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.ServerID]string) error {
+func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.ServerID]string, fileType string) error {
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
@@ -225,14 +267,14 @@ func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.Serv
 
 	for _, rserver := range replicasAddr {
 		wg.Add(1)
-		go func(serverAddr string) {
+		go func(serverAddr string, fileTyple string) {
 			defer wg.Done()
-			if err := sendChunkWithRetry(dstPath, chunkID, serverAddr); err != nil {
+			if err := sendChunkWithRetry(dstPath, chunkID, serverAddr, fileTyple); err != nil {
 				mu.Lock()
 				errs = append(errs, fmt.Errorf("replica %s: %w", serverAddr, err))
 				mu.Unlock()
 			}
-		}(string(rserver))
+		}(string(rserver), fileType)
 	}
 
 	wg.Wait()
@@ -240,7 +282,7 @@ func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.Serv
 }
 
 // sendChunkWithRetry attempts to POST the chunk to serverAddr with linear back-off.
-func sendChunkWithRetry(dstPath, chunkID, serverAddr string) error {
+func sendChunkWithRetry(dstPath, chunkID, serverAddr, fileType string) error {
 	replicaURL := fmt.Sprintf("http://%s/replicate_chunk/%s", serverAddr, chunkID)
 
 	var lastErr error
@@ -248,7 +290,7 @@ func sendChunkWithRetry(dstPath, chunkID, serverAddr string) error {
 		if attempt > 0 {
 			time.Sleep(retryDelay * time.Duration(attempt))
 		}
-		if err := sendChunk(dstPath, replicaURL); err != nil {
+		if err := sendChunk(dstPath, replicaURL, fileType); err != nil {
 			lastErr = err
 			log.Printf("sendChunkWithRetry: attempt %d/%d failed for %s: %v", attempt+1, maxRetries, serverAddr, err)
 			continue
@@ -260,7 +302,7 @@ func sendChunkWithRetry(dstPath, chunkID, serverAddr string) error {
 }
 
 // sendChunk performs a single POST of the chunk file to replicaURL.
-func sendChunk(dstPath, replicaURL string) error {
+func sendChunk(dstPath, replicaURL, fileType string) error {
 	f, err := os.Open(dstPath)
 	if err != nil {
 		return fmt.Errorf("open chunk file: %w", err)
@@ -270,6 +312,7 @@ func sendChunk(dstPath, replicaURL string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), replicateTimeout)
 	defer cancel()
 
+	replicaURL = replicaURL + "?type=" + url.QueryEscape(fileType)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, replicaURL, f)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -327,11 +370,11 @@ func (c *ChunkServer) registerWithMaster() error {
 	return nil
 }
 
-func sendHeartBeat(masterServerAddr, serverID string, diskSpace, diskUsed int64) error {
+func sendHeartBeat(masterServerAddr, serverID string, diskSpace int64, diskUsed atomic.Int64) error {
 	hb := models.HeartBeat{
 		ServerID:       models.ServerID(serverID),
 		TotalDiskSpace: diskSpace,
-		DiskUsed:       diskUsed,
+		DiskUsed:       diskUsed.Load(),
 	}
 	pl, err := json.Marshal(hb)
 	if err != nil {

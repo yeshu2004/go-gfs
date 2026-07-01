@@ -39,7 +39,7 @@ type MasterServer struct {
 
 	fileToChunks  map[string][]models.ChunkID
 	pendingChunks map[models.ChunkID]PendingChunk   // temprory state
-	chunkToServer map[models.ChunkID][]PendingChunk // update: after commit to disk
+	chunkToServer map[models.ChunkID]PendingChunk // update: after commit to disk
 }
 
 func NewMasterServer(listenAddr string) *MasterServer {
@@ -49,22 +49,51 @@ func NewMasterServer(listenAddr string) *MasterServer {
 		chunkMeta:     make(map[models.ServerID]ChunkMeta),
 		fileToChunks:  make(map[string][]models.ChunkID),
 		pendingChunks: make(map[models.ChunkID]PendingChunk),
-		chunkToServer: make(map[models.ChunkID][]PendingChunk),
+		chunkToServer: make(map[models.ChunkID]PendingChunk),
 	}
 }
 
 func (m *MasterServer) RunServer() error {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/register", m.registerChunkServerHandler) // WORKING
-	mux.HandleFunc("/heartbeat", m.heartBeatsHandler)         // WORKING
-	mux.HandleFunc("/chunk-server", m.allocateChunkHandler)   // WORKING
-	mux.HandleFunc("/chunk-info/{chunk_id}", m.verfiyAndChunkInfoHandler)
+	mux.HandleFunc("/register", m.registerChunkServerHandler)             // WORKING
+	mux.HandleFunc("/heartbeat", m.heartBeatsHandler)                     // WORKING
+	mux.HandleFunc("/chunk-server", m.allocateChunkHandler)               // WORKING
+	mux.HandleFunc("/chunk-info/{chunk_id}", m.verfiyAndChunkInfoHandler) // WORKING
+	mux.HandleFunc("/update_file_metadata/{chunk_id}", m.updateFileMetaData)
 
 	go m.monitorHeartbeats()
 
 	log.Printf("master server about to listen on %s", m.listenAddr)
 	return http.ListenAndServe(m.listenAddr, mux)
+}
+
+// basically delete pending chunk state in its data
+func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Request) {
+	chunkID := r.PathValue("chunk_id")
+
+	if chunkID == "" {
+		http.Error(rw, "missing chunk id", http.StatusBadRequest)
+		return
+	}
+	log.Println("requested chunk on Maaster Server for updating file MetaData :", chunkID)
+
+	m.mu.Lock();
+	defer m.mu.Unlock();
+
+	pending := m.pendingChunks[models.ChunkID(chunkID)]
+	delete(m.pendingChunks, models.ChunkID(chunkID))
+	log.Printf("pending chunk (%s) state updated i.e deleted", chunkID)
+
+	_, exists := m.chunkToServer[models.ChunkID(chunkID)]; 
+	if exists{
+		http.Error(rw, "chunkID already commited in server !! (should never happen)", http.StatusBadRequest);
+		return
+	}
+	m.chunkToServer[models.ChunkID(chunkID)] = pending;
+
+	log.Printf("chunk (%s) state updated...", chunkID)
+	rw.WriteHeader(http.StatusOK)
 }
 
 func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http.Request) {
@@ -86,7 +115,6 @@ func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http
 		http.Error(rw, fmt.Sprintf("%s doesn't have any replicas or is not registered with us...", chunkID), http.StatusBadRequest)
 		return
 	}
-
 
 	m.mu.RLock()
 	replicaAddrs := make(map[models.ServerID]string, len(chunk.Replicas))
@@ -161,14 +189,16 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 	// paper suggests for 64 bit bcz for memory efficiency
 	chunkId := uuid.New().String()
 
-	// 4. substract the available space for those server for now
+	// 5. substract the available space for those server for now
 	for _, server := range selectedServer {
 		meta := m.chunkMeta[server]
 		meta.ReservedDisk += ChunkSize
 		m.chunkMeta[server] = meta
+
+
 	}
 
-	// 5. update fileToChunks & chunkToServer
+	// 6. update fileToChunks & chunkToServer
 	m.fileToChunks[pl.FileName] = append(m.fileToChunks[pl.FileName], models.ChunkID(chunkId))
 	m.pendingChunks[models.ChunkID(chunkId)] = PendingChunk{
 		ChunkID:  models.ChunkID(chunkId),
@@ -189,7 +219,7 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 	primaryServer := selectedServer[0]
 	primaryAddr := m.chunkMeta[primaryServer].Addr
 
-	// 6. retrun back the chunkID & servers to client
+	// 7. retrun back the chunkID & servers to client
 	rw.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(rw).Encode(AllocateChunkResponse{
 		ChunkID:     models.ChunkID(chunkId),
@@ -263,3 +293,6 @@ func (m *MasterServer) monitorHeartbeats() {
 		m.mu.Unlock()
 	}
 }
+
+
+
