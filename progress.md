@@ -13,3 +13,7 @@
 2) Master writes an entry to WAL file/ Log file i.e. filename & fileToChunk mapping like Allocate 
 923847 Chunk for /logs/filename.txt
 
+
+## Images
+![alt text](one.png)
+![alt text](two.png)
