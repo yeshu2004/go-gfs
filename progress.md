@@ -6,6 +6,7 @@
 4) Heartbeats not recived so declared unactive and removed from heartbeat map
 5) Done background Heartbeats at every 5 second 
 6) Route GET /chunk-server working i.e. reteriving chunk_id & chunk_servers
+7) Upload implement to the chunk servers along with replication and disk space deduction 
 
 ## To Implement 
 1) Chunk id = logical timestamp when created
