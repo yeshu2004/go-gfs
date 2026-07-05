@@ -38,7 +38,7 @@ type MasterServer struct {
 	mu         sync.RWMutex
 
 	fileToChunks  map[string][]models.ChunkID
-	pendingChunks map[models.ChunkID]PendingChunk   // temprory state
+	pendingChunks map[models.ChunkID]PendingChunk // temprory state
 	chunkToServer map[models.ChunkID]PendingChunk // update: after commit to disk
 }
 
@@ -53,19 +53,35 @@ func NewMasterServer(listenAddr string) *MasterServer {
 	}
 }
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (m *MasterServer) RunServer() error {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/register", m.registerChunkServerHandler)             // WORKING
 	mux.HandleFunc("/heartbeat", m.heartBeatsHandler)                     // WORKING
 	mux.HandleFunc("/chunk-server", m.allocateChunkHandler)               // WORKING
+	mux.HandleFunc("/max-chunk-size", m.returnMaxChunkSizeHandler);
 	mux.HandleFunc("/chunk-info/{chunk_id}", m.verfiyAndChunkInfoHandler) // WORKING
 	mux.HandleFunc("/update_file_metadata/{chunk_id}", m.updateFileMetaData)
 
 	go m.monitorHeartbeats()
 
+	handler := corsMiddleware(mux)
+
 	log.Printf("master server about to listen on %s", m.listenAddr)
-	return http.ListenAndServe(m.listenAddr, mux)
+	return http.ListenAndServe(m.listenAddr, handler)
 }
 
 // basically delete pending chunk state in its data
@@ -78,23 +94,38 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 	}
 	log.Println("requested chunk on Maaster Server for updating file MetaData :", chunkID)
 
-	m.mu.Lock();
-	defer m.mu.Unlock();
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	pending := m.pendingChunks[models.ChunkID(chunkID)]
 	delete(m.pendingChunks, models.ChunkID(chunkID))
 	log.Printf("pending chunk (%s) state updated i.e deleted", chunkID)
 
-	_, exists := m.chunkToServer[models.ChunkID(chunkID)]; 
-	if exists{
-		http.Error(rw, "chunkID already commited in server !! (should never happen)", http.StatusBadRequest);
+	_, exists := m.chunkToServer[models.ChunkID(chunkID)]
+	if exists {
+		http.Error(rw, "chunkID already commited in server !! (should never happen)", http.StatusBadRequest)
 		return
 	}
-	m.chunkToServer[models.ChunkID(chunkID)] = pending;
+	m.chunkToServer[models.ChunkID(chunkID)] = pending
 
 	log.Printf("chunk (%s) state updated...", chunkID)
 	rw.WriteHeader(http.StatusOK)
 }
+
+func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http.Request){
+	if r.Method != http.MethodGet{
+		http.Error(rw, fmt.Sprintf("%v not allowed", r.Method), http.StatusMethodNotAllowed)
+		return
+	}
+	type ChunkSizeReponse struct{
+		MaxChunkSize int64 `json:"max_chunk_size"`
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(ChunkSizeReponse{
+		MaxChunkSize:   ChunkSize,
+	})
+}
+
 
 func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http.Request) {
 	chunkID := r.PathValue("chunk_id")
@@ -195,7 +226,6 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		meta.ReservedDisk += ChunkSize
 		m.chunkMeta[server] = meta
 
-
 	}
 
 	// 6. update fileToChunks & chunkToServer
@@ -211,9 +241,10 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 
 	type AllocateChunkResponse struct {
 		ChunkID     models.ChunkID    `json:"chunk_id"`
-		Primary     models.ServerID   `json:"primary_server"`
+		Primary     models.ServerID   `json:"primary_server_name"`
 		Replicas    []models.ServerID `json:"replica_servers"`
 		PrimaryAddr string            `json:"primary_addr"`
+		ChunkSize   int64             `json:"chunk_size"`
 	}
 
 	primaryServer := selectedServer[0]
@@ -226,6 +257,7 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		Primary:     primaryServer,
 		Replicas:    selectedServer[1:],
 		PrimaryAddr: primaryAddr,
+		ChunkSize:   ChunkSize,
 	})
 }
 
@@ -293,6 +325,3 @@ func (m *MasterServer) monitorHeartbeats() {
 		m.mu.Unlock()
 	}
 }
-
-
-

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +20,8 @@ import (
 )
 
 var (
-	MaxUploadSize = 64 * 1024 * 1024
+	ChunkSize     = 64 * 1024 * 1024 // 64 MB (used by master/frontend)
+    MaxUploadSize = 65 * 1024 * 1024 // 65 MB (server accepts multipart overhead)
 )
 
 const (
@@ -45,6 +45,19 @@ func newRegisterPayload(id, addr string, disk int64) *models.RegisterPayload {
 		Addr: addr,
 		Disk: disk,
 	}
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func NewChunkServer(serverID string, listenAddr string, masterAddr string, disksize int64) *ChunkServer {
@@ -76,8 +89,10 @@ func (c *ChunkServer) RunServer() {
 	mux.HandleFunc("/upload/{chunk_id}", c.uploadChunkToServerHandler)
 	mux.HandleFunc("/replicate_chunk/{chunk_id}", c.replicateChunkHandler)
 
+	handler := corsMiddleware(mux)
+
 	log.Printf("chunk server about to listen on %s", c.listenAddr)
-	if err := http.ListenAndServe(c.listenAddr, mux); err != nil {
+	if err := http.ListenAndServe(c.listenAddr, handler); err != nil {
 		log.Printf("(%s) server error: %v", c.listenAddr, err)
 	}
 }
@@ -122,42 +137,42 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 
 	file, fileHeader, err := r.FormFile("video_chunk")
 	if err != nil {
-		http.Error(rw, "failed to parse form file key 'video'", http.StatusBadRequest)
-		return // BUG FIX: was missing, execution continued after this error
+		http.Error(rw, fmt.Sprintf("failed to parse form file key 'video': %v", err), http.StatusBadRequest)
+		return
 	}
 	defer file.Close()
 
-	buff := make([]byte, 512)
-	if _, err := file.Read(buff); err != nil {
-		http.Error(rw, "failed to read file headers", http.StatusInternalServerError)
-		return
-	}
+	// buff := make([]byte, 512)
+	// if _, err := file.Read(buff); err != nil {
+	// 	http.Error(rw, "failed to read file headers", http.StatusInternalServerError)
+	// 	return
+	// }
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		http.Error(rw, "Failed to reset file pointer", http.StatusInternalServerError)
-		return
-	}
+	// if _, err := file.Seek(0, io.SeekStart); err != nil {
+	// 	http.Error(rw, "Failed to reset file pointer", http.StatusInternalServerError)
+	// 	return
+	// }
 
-	fileType := http.DetectContentType(buff)
-	if fileType != "video/mp4" && fileType != "video/webm" && fileType != "application/octet-stream" {
-		http.Error(rw, "Invalid file format. Only MP4 and WebM are allowed.", http.StatusBadRequest)
-		return
-	}
+	// fileType := http.DetectContentType(buff)
+	// if fileType != "video/mp4" && fileType != "video/webm" && fileType != "application/octet-stream" {
+	// 	http.Error(rw, "Invalid file format. Only MP4 and WebM are allowed.", http.StatusBadRequest)
+	// 	return
+	// }
 
-	var ext string
-	switch fileType {
-	case "video/mp4":
-		ext = "mp4"
-	case "video/webm":
-		ext = "webm"
-	case "application/octet-stream":
-		ext = "bin"
-	default:
-		http.Error(rw, "Unsupported file type", http.StatusBadRequest)
-		return
-	}
+	// var ext string
+	// switch fileType {
+	// case "video/mp4":
+	// 	ext = "mp4"
+	// case "video/webm":
+	// 	ext = "webm"
+	// case "application/octet-stream":
+	// 	ext = "bin"
+	// default:
+	// 	http.Error(rw, "Unsupported file type", http.StatusBadRequest)
+	// 	return
+	// }
 
-	fileName := fmt.Sprintf("%s.%s", string(vaildInfo.ChunkID), ext)
+	fileName := fmt.Sprintf("%s", string(vaildInfo.ChunkID))
 	dstPath := filepath.Join(c.storageDir, fileName)
 	if err := os.MkdirAll(filepath.Dir(dstPath), os.ModePerm); err != nil {
 		http.Error(rw, "failed to create storage directory", http.StatusInternalServerError)
@@ -186,7 +201,7 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 
 	log.Printf("copied file (%v), size (%d) from client\n", fileHeader.Filename, fileSize);
 
-	if err := replicateChunk(dstPath, string(vaildInfo.ChunkID), vaildInfo.ReplicaAddrs, ext); err != nil {
+	if err := replicateChunk(dstPath, string(vaildInfo.ChunkID), vaildInfo.ReplicaAddrs); err != nil {
 		log.Printf("replication chunk error: %v\n", err)
 		// NOTE: chunk is saved locally but replication failed.
 		// Returning 500 here lets the client know to retry or alert.
@@ -218,9 +233,7 @@ func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		http.Error(rw, "missing chunk ID", http.StatusBadRequest)
 		return
 	}
-
-	fileType := r.URL.Query().Get("type")
-	chunkID = fmt.Sprintf("%s.%s", chunkID, fileType);
+	chunkID = fmt.Sprintln(chunkID);
 
 	dstPath := filepath.Join(c.storageDir, chunkID)
 	f, err := os.Create(dstPath)
@@ -258,7 +271,7 @@ func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Requ
 
 // replicateChunk fans out the chunk at dstPath to all replica servers in parallel.
 // it returns a joined error if any replica fails after all retries.
-func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.ServerID]string, fileType string) error {
+func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.ServerID]string) error {
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
@@ -267,14 +280,14 @@ func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.Serv
 
 	for _, rserver := range replicasAddr {
 		wg.Add(1)
-		go func(serverAddr string, fileTyple string) {
+		go func(serverAddr string) {
 			defer wg.Done()
-			if err := sendChunkWithRetry(dstPath, chunkID, serverAddr, fileTyple); err != nil {
+			if err := sendChunkWithRetry(dstPath, chunkID, serverAddr); err != nil {
 				mu.Lock()
 				errs = append(errs, fmt.Errorf("replica %s: %w", serverAddr, err))
 				mu.Unlock()
 			}
-		}(string(rserver), fileType)
+		}(string(rserver))
 	}
 
 	wg.Wait()
@@ -282,7 +295,7 @@ func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.Serv
 }
 
 // sendChunkWithRetry attempts to POST the chunk to serverAddr with linear back-off.
-func sendChunkWithRetry(dstPath, chunkID, serverAddr, fileType string) error {
+func sendChunkWithRetry(dstPath, chunkID, serverAddr string) error {
 	replicaURL := fmt.Sprintf("http://%s/replicate_chunk/%s", serverAddr, chunkID)
 
 	var lastErr error
@@ -290,7 +303,7 @@ func sendChunkWithRetry(dstPath, chunkID, serverAddr, fileType string) error {
 		if attempt > 0 {
 			time.Sleep(retryDelay * time.Duration(attempt))
 		}
-		if err := sendChunk(dstPath, replicaURL, fileType); err != nil {
+		if err := sendChunk(dstPath, replicaURL); err != nil {
 			lastErr = err
 			log.Printf("sendChunkWithRetry: attempt %d/%d failed for %s: %v", attempt+1, maxRetries, serverAddr, err)
 			continue
@@ -302,7 +315,7 @@ func sendChunkWithRetry(dstPath, chunkID, serverAddr, fileType string) error {
 }
 
 // sendChunk performs a single POST of the chunk file to replicaURL.
-func sendChunk(dstPath, replicaURL, fileType string) error {
+func sendChunk(dstPath, replicaURL string) error {
 	f, err := os.Open(dstPath)
 	if err != nil {
 		return fmt.Errorf("open chunk file: %w", err)
@@ -312,7 +325,6 @@ func sendChunk(dstPath, replicaURL, fileType string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), replicateTimeout)
 	defer cancel()
 
-	replicaURL = replicaURL + "?type=" + url.QueryEscape(fileType)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, replicaURL, f)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
