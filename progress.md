@@ -7,6 +7,7 @@
 5) Done background Heartbeats at every 5 second 
 6) Route GET /chunk-server working i.e. reteriving chunk_id & chunk_servers
 7) Upload implement to the chunk servers along with replication and disk space deduction 
+8) Implemented gfs client i.e. repo: https://github.com/yeshu2004/go-gfs-client
 
 ## To Implement 
 
@@ -23,5 +24,5 @@
 
 
 ## Images
-![alt text](one.png)
-![alt text](two.png)
+![alt text](screenshots/one.png)
+![alt text](screenshots/two.png)
