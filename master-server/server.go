@@ -31,23 +31,29 @@ type PendingChunk struct {
 	Replicas []models.ServerID
 }
 
+// Q) Do we have to store the meta data in the master server i.e for the file we would store the
+// file meta data like filsize, file uuid genrated, file to chunk mapping(already implemented), also
+// we can store the checksum to on each chunk meta data ?
+
 type MasterServer struct {
 	listenAddr string
 	heartbeats map[models.ServerID]time.Time
 	chunkMeta  map[models.ServerID]ChunkMeta
 	mu         sync.RWMutex
 
-	fileToChunks  map[string][]models.ChunkID
+	fileMetaData map[string]models.FileMetaData
+	// fileToChunks  map[string][]models.ChunkID
 	pendingChunks map[models.ChunkID]PendingChunk // temprory state
 	chunkToServer map[models.ChunkID]PendingChunk // update: after commit to disk
 }
 
 func NewMasterServer(listenAddr string) *MasterServer {
 	return &MasterServer{
-		listenAddr:    listenAddr,
-		heartbeats:    make(map[models.ServerID]time.Time),
-		chunkMeta:     make(map[models.ServerID]ChunkMeta),
-		fileToChunks:  make(map[string][]models.ChunkID),
+		listenAddr:   listenAddr,
+		heartbeats:   make(map[models.ServerID]time.Time),
+		chunkMeta:    make(map[models.ServerID]ChunkMeta),
+		fileMetaData: make(map[string]models.FileMetaData),
+		// fileToChunks:  make(map[string][]models.ChunkID),
 		pendingChunks: make(map[models.ChunkID]PendingChunk),
 		chunkToServer: make(map[models.ChunkID]PendingChunk),
 	}
@@ -69,12 +75,13 @@ func corsMiddleware(next http.Handler) http.Handler {
 func (m *MasterServer) RunServer() error {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/register", m.registerChunkServerHandler)             // WORKING
-	mux.HandleFunc("/heartbeat", m.heartBeatsHandler)                     // WORKING
-	mux.HandleFunc("/chunk-server", m.allocateChunkHandler)               // WORKING
-	mux.HandleFunc("/max-chunk-size", m.returnMaxChunkSizeHandler);
+	mux.HandleFunc("/register", m.registerChunkServerHandler) // WORKING
+	mux.HandleFunc("/heartbeat", m.heartBeatsHandler)         // WORKING
+	mux.HandleFunc("/chunk-server", m.allocateChunkHandler)   // WORKING
+	mux.HandleFunc("/max-chunk-size", m.returnMaxChunkSizeHandler)
 	mux.HandleFunc("/chunk-info/{chunk_id}", m.verfiyAndChunkInfoHandler) // WORKING
 	mux.HandleFunc("/update_file_metadata/{chunk_id}", m.updateFileMetaData)
+	mux.HandleFunc("/file-info/{file_id}", m.fileInfoHandler) // WORKING
 
 	go m.monitorHeartbeats()
 
@@ -83,6 +90,55 @@ func (m *MasterServer) RunServer() error {
 	log.Printf("master server about to listen on %s", m.listenAddr)
 	return http.ListenAndServe(m.listenAddr, handler)
 }
+
+func (m *MasterServer) fileInfoHandler(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(rw, fmt.Sprintf("%v not allowed", r.Method), http.StatusMethodNotAllowed)
+		return
+	}
+
+	fileID := r.PathValue("file_id")
+	if fileID == "" {
+		http.Error(rw, "missing file id", http.StatusBadRequest)
+		return
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	fileMeta, ok := m.fileMetaData[fileID]
+	if !ok {
+		http.Error(rw, fmt.Sprintf("file (%s) not found", fileID), http.StatusNotFound)
+		return
+	}
+
+	chunks := make([]models.ChunkLocation, 0, len(fileMeta.ChunkIDs))
+	for _, chunkID := range fileMeta.ChunkIDs {
+		committed, ok := m.chunkToServer[chunkID]
+		if !ok {
+			http.Error(rw, fmt.Sprintf("file (%s) is not fully committed, chunk (%s) missing", fileID, chunkID), http.StatusConflict)
+			return
+		}
+
+		primaryAddr := m.chunkMeta[committed.Primary].Addr
+		chunks = append(chunks, models.ChunkLocation{
+			ChunkID:     committed.ChunkID,
+			Primary:     committed.Primary,
+			PrimaryAddr: primaryAddr,
+			Replicas:    committed.Replicas,
+		})
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(models.FileInfoResponse{
+		FileID:    fileMeta.FileID,
+		FileName:  fileMeta.FileName,
+		Size:      fileMeta.Size,
+		CreatedAt: fileMeta.CreatedAt,
+		Chunks:    chunks,
+	})
+}
+
 
 // basically delete pending chunk state in its data
 func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Request) {
@@ -108,24 +164,62 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 	}
 	m.chunkToServer[models.ChunkID(chunkID)] = pending
 
+	// TODO: update the file meta data i.e status = "commited" if successfull
+
 	log.Printf("chunk (%s) state updated...", chunkID)
 	rw.WriteHeader(http.StatusOK)
 }
 
-func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http.Request){
-	if r.Method != http.MethodGet{
+func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(rw, fmt.Sprintf("%v not allowed", r.Method), http.StatusMethodNotAllowed)
 		return
 	}
-	type ChunkSizeReponse struct{
-		MaxChunkSize int64 `json:"max_chunk_size"`
+
+	// genrate a uuid i.e fileID
+	type metaData struct {
+		FileName string `json:"file_name"`
+		Size     int64  `json:"size"`
 	}
+
+	var fileMetaInfo metaData
+	if err := json.NewDecoder(r.Body).Decode(&fileMetaInfo); err != nil {
+		http.Error(rw, "decoder error at fileMetaData", http.StatusBadRequest)
+		return
+	}
+
+	fileID := uuid.NewString()
+	fileInfo := models.FileMetaData{
+		FileID:    fileID,
+		FileName:  fileMetaInfo.FileName,
+		Size:      fileMetaInfo.Size,
+		CreatedAt: time.Now(),
+		Status:    "pending",
+	}
+
+	m.mu.Lock()
+	m.fileMetaData[fileID] = fileInfo
+	m.mu.Unlock()
+
+	type ChunkSizeReponse struct {
+		FileID       string    `json:"file_id"`
+		FileName     string    `json:"file_name"`
+		Size         int64     `json:"size"`
+		CreatedAt    time.Time `json:"created_at"`
+		Status       string    `json:"status"`
+		MaxChunkSize int64     `json:"max_chunk_size"`
+	}
+
 	rw.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(rw).Encode(ChunkSizeReponse{
-		MaxChunkSize:   ChunkSize,
+		FileID:       fileInfo.FileID,
+		FileName:     fileInfo.FileName,
+		Size:         fileInfo.Size,
+		CreatedAt:    fileInfo.CreatedAt,
+		Status:       fileInfo.Status,
+		MaxChunkSize: ChunkSize,
 	})
 }
-
 
 func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http.Request) {
 	chunkID := r.PathValue("chunk_id")
@@ -178,7 +272,7 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 
 	// 0. recive filename along with every chunk
 	type reqBody struct {
-		FileName string `json:"file_name"`
+		FileID string `json:"file_id"`
 	}
 
 	var pl reqBody
@@ -187,12 +281,35 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	log.Printf("fileID: %s", pl.FileID)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	// 1. ensure file entry exists
-	if _, exists := m.fileToChunks[pl.FileName]; !exists {
-		m.fileToChunks[pl.FileName] = []models.ChunkID{}
+	// if _, exists := m.fileToChunks[pl.FileName]; !exists {
+	// 	m.fileToChunks[pl.FileName] = []models.ChunkID{}
+	// }
+
+	// m.fileMetaData[].FileName
+
+	meta, ok := m.fileMetaData[pl.FileID]
+	if !ok {
+		http.Error(rw, fmt.Sprintf("file (%s) not found", pl.FileID), http.StatusNotFound)
+		return
 	}
+	log.Printf("fileSize: %s, fileName: %s", meta.FileID, meta.FileName)
+
+	// if user has a file to upload i.e it would have multiple chunks which would have to be uploded
+	// so each file should have a unique name corrosponding to it, and to make it unique every time either
+	// we could version it if user upload the same file again and again or we have gentrate a new uuid or
+	// we would not allow the same file name to be in the our storage server. It's basiclly how we design
+	// and what we want from the user.
+
+	// to make every file unqiue we could genrate a uuid (128 bit) and assign every file a uuid i.e. only
+	// uuid will be saved not file name ,so if a user upload the same file again, it would genrate a new
+	// uuid back again making it a new unique file again. Then we would have to map each file UUID with the
+	// chunk UUID'S.
 
 	// 2. find healty & eligible servers
 	var eligibleServers []models.ServerID
@@ -229,7 +346,10 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 	}
 
 	// 6. update fileToChunks & chunkToServer
-	m.fileToChunks[pl.FileName] = append(m.fileToChunks[pl.FileName], models.ChunkID(chunkId))
+	// m.fileToChunks[pl.FileName] = append(m.fileToChunks[pl.FileName], models.ChunkID(chunkId))
+	meta.ChunkIDs = append(meta.ChunkIDs, models.ChunkID(chunkId))
+	m.fileMetaData[pl.FileID] = meta
+
 	m.pendingChunks[models.ChunkID(chunkId)] = PendingChunk{
 		ChunkID:  models.ChunkID(chunkId),
 		Primary:  selectedServer[0],
