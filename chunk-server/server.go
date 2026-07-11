@@ -210,7 +210,7 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 	}
 
 	// update the master state.....
-	res, err := http.Post(fmt.Sprintf("http://%s/update_file_metadata/{%s}", c.masterAddr, chunkID),"application/json; charset=utf-8", nil);
+	res, err := http.Post(fmt.Sprintf("http://%s/update_file_metadata/%s", c.masterAddr, chunkID),"application/json; charset=utf-8", nil);
 
 	if err != nil{
 		http.Error(rw, fmt.Sprintf("error in updating file chunk metadata: %v", err), http.StatusInternalServerError);
@@ -233,7 +233,6 @@ func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		http.Error(rw, "missing chunk ID", http.StatusBadRequest)
 		return
 	}
-	chunkID = fmt.Sprintln(chunkID);
 
 	dstPath := filepath.Join(c.storageDir, chunkID)
 	f, err := os.Create(dstPath)
