@@ -11,7 +11,7 @@ import (
 var (
 	MasterServerAddr = ":8000"
 	ChunkServerAddr = []string{":4001", ":4002", ":4003", ":4004"}
-	ServerDiskSpace = 1_000_000_000
+	ServerDiskSpace = 10_000_000_000 // 10 GB per server...
 )
 
 
