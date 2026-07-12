@@ -3,6 +3,8 @@ package chunkserver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +23,7 @@ import (
 
 var (
 	ChunkSize     = 64 * 1024 * 1024 // 64 MB (used by master/frontend)
-    MaxUploadSize = 65 * 1024 * 1024 // 65 MB (server accepts multipart overhead)
+	MaxUploadSize = 65 * 1024 * 1024 // 65 MB (server accepts multipart overhead)
 )
 
 const (
@@ -186,22 +188,29 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, file); err != nil {
+	hasher := sha256.New()
+	multi := io.MultiWriter(dst, hasher)
+
+	if _, err := io.Copy(multi, file); err != nil {
 		http.Error(rw, "failed to copy file contents", http.StatusInternalServerError)
 		return
 	}
 
-	fileInfo , err := os.Stat(dstPath);
-	if err != nil{
+	// after the file has been copied to primary....
+	primaryChecksum := hex.EncodeToString(hasher.Sum(nil))
+
+	fileInfo, err := os.Stat(dstPath)
+	if err != nil {
 		http.Error(rw, "failed to get describing the named file.", http.StatusInternalServerError)
 		return
 	}
-	fileSize := fileInfo.Size();
-	c.used.Add(fileSize);
+	fileSize := fileInfo.Size()
+	c.used.Add(fileSize)
 
-	log.Printf("copied file (%v), size (%d) from client\n", fileHeader.Filename, fileSize);
+	log.Printf("copied file (%v), size (%d), checksum (%s) from client\n", fileHeader.Filename, fileSize, primaryChecksum)
 
-	if err := replicateChunk(dstPath, string(vaildInfo.ChunkID), vaildInfo.ReplicaAddrs); err != nil {
+	replicaChecksums, err := replicateChunk(dstPath, string(vaildInfo.ChunkID), vaildInfo.ReplicaAddrs)
+	if err != nil {
 		log.Printf("replication chunk error: %v\n", err)
 		// NOTE: chunk is saved locally but replication failed.
 		// Returning 500 here lets the client know to retry or alert.
@@ -209,23 +218,30 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 		return
 	}
 
-	// update the master state.....
-	res, err := http.Post(fmt.Sprintf("http://%s/update_file_metadata/%s", c.masterAddr, chunkID),"application/json; charset=utf-8", nil);
-
-	if err != nil{
-		http.Error(rw, fmt.Sprintf("error in updating file chunk metadata: %v", err), http.StatusInternalServerError);
-		return;
+	// checksum verification of primary and replicas
+	for serverAddr, checkSum := range replicaChecksums {
+		if checkSum != primaryChecksum {
+			log.Printf("checksum mismatch: primary=%s replica(%s)=%s", primaryChecksum, serverAddr, checkSum)
+			http.Error(rw, fmt.Sprintf("checksum mismatch with replica %s, refusing to commit", serverAddr), http.StatusInternalServerError)
+			return
+		}
 	}
 
-	if res.StatusCode != http.StatusOK{
-		http.Error(rw, "status code error in updating file chunk metadata", http.StatusInternalServerError);
-		return;
+	// update the master state.....
+	res, err := http.Post(fmt.Sprintf("http://%s/update_file_metadata/%s", c.masterAddr, chunkID), "application/json; charset=utf-8", nil)
+	if err != nil {
+		http.Error(rw, fmt.Sprintf("error in updating file chunk metadata: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if res.StatusCode != http.StatusOK {
+		http.Error(rw, "status code error in updating file chunk metadata", http.StatusInternalServerError)
+		return
 	}
 
 	rw.WriteHeader(http.StatusCreated)
 	fmt.Fprintf(rw, "Video successfully uploaded and saved: %s", fileHeader.Filename)
 }
-
 
 func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Request) {
 	chunkID := r.PathValue("chunk_id")
@@ -244,57 +260,71 @@ func (c *ChunkServer) replicateChunkHandler(rw http.ResponseWriter, r *http.Requ
 	}
 	defer f.Close()
 
-	if _, err := io.Copy(f, r.Body); err != nil {
+	hasher := sha256.New()
+	multi := io.MultiWriter(f, hasher)
+
+	if _, err := io.Copy(multi, r.Body); err != nil {
 		log.Printf("replicateChunkHandler: failed to write chunk %s: %v", chunkID, err)
 		os.Remove(dstPath) // clean up partial file
 		http.Error(rw, "failed to write chunk", http.StatusInternalServerError)
 		return
 	}
 
-	fileInfo, err := f.Stat();
-	if err != nil{
+	fileInfo, err := f.Stat()
+	if err != nil {
 		http.Error(rw, "failed to get describing the named file.", http.StatusInternalServerError)
 		return
 	}
-	fileSize := fileInfo.Size();
-	c.used.Add(fileSize);
-	log.Printf("%s - disk size updated....", c.listenAddr);
+	fileSize := fileInfo.Size()
+	c.used.Add(fileSize)
+	log.Printf("%s - disk size updated....", c.listenAddr)
+	log.Printf("(%s) - copied the file: %s on the server (%s)", r.RemoteAddr, chunkID, c.listenAddr)
 
-	log.Printf("(%s) - copied the file: %s on the server (%s)", r.RemoteAddr, chunkID, c.listenAddr);
+	checksum := hex.EncodeToString(hasher.Sum(nil))
+
+	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusOK)
+	json.NewEncoder(rw).Encode(models.ReplicateChunkResponse{
+		Checksum: checksum,
+		Size:     fileSize,
+	})
 }
-
 
 // ---------------- HELPER FUNCTION -----------------------------
 
-
 // replicateChunk fans out the chunk at dstPath to all replica servers in parallel.
 // it returns a joined error if any replica fails after all retries.
-func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.ServerID]string) error {
+func replicateChunk(dstPath string, chunkID string, replicasAddr map[models.ServerID]string) (map[string]string, error) {
 	var (
-		wg   sync.WaitGroup
-		mu   sync.Mutex
-		errs []error
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		errs      []error
+		checksums = make(map[string]string, len(replicasAddr))
 	)
 
 	for _, rserver := range replicasAddr {
 		wg.Add(1)
 		go func(serverAddr string) {
 			defer wg.Done()
-			if err := sendChunkWithRetry(dstPath, chunkID, serverAddr); err != nil {
-				mu.Lock()
+			checksum, err := sendChunkWithRetry(dstPath, chunkID, serverAddr)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
 				errs = append(errs, fmt.Errorf("replica %s: %w", serverAddr, err))
-				mu.Unlock()
 			}
+			checksums[serverAddr] = checksum
 		}(string(rserver))
 	}
 
 	wg.Wait()
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return checksums, nil
 }
 
 // sendChunkWithRetry attempts to POST the chunk to serverAddr with linear back-off.
-func sendChunkWithRetry(dstPath, chunkID, serverAddr string) error {
+func sendChunkWithRetry(dstPath, chunkID, serverAddr string) (string, error) {
 	replicaURL := fmt.Sprintf("http://%s/replicate_chunk/%s", serverAddr, chunkID)
 
 	var lastErr error
@@ -302,22 +332,23 @@ func sendChunkWithRetry(dstPath, chunkID, serverAddr string) error {
 		if attempt > 0 {
 			time.Sleep(retryDelay * time.Duration(attempt))
 		}
-		if err := sendChunk(dstPath, replicaURL); err != nil {
+		checksum, err := sendChunk(dstPath, replicaURL)
+		if err != nil {
 			lastErr = err
 			log.Printf("sendChunkWithRetry: attempt %d/%d failed for %s: %v", attempt+1, maxRetries, serverAddr, err)
 			continue
 		}
-		return nil
+		return checksum, nil
 	}
 
-	return fmt.Errorf("all %d attempts failed: %w", maxRetries, lastErr)
+	return "", fmt.Errorf("all %d attempts failed: %w", maxRetries, lastErr)
 }
 
 // sendChunk performs a single POST of the chunk file to replicaURL.
-func sendChunk(dstPath, replicaURL string) error {
+func sendChunk(dstPath, replicaURL string) (string, error) {
 	f, err := os.Open(dstPath)
 	if err != nil {
-		return fmt.Errorf("open chunk file: %w", err)
+		return "", fmt.Errorf("open chunk file: %w", err)
 	}
 	defer f.Close()
 
@@ -326,23 +357,31 @@ func sendChunk(dstPath, replicaURL string) error {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, replicaURL, f)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return "", fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("http post: %w", err)
+		return "", fmt.Errorf("http post: %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+		io.Copy(io.Discard, resp.Body)
+		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	var result struct {
+		Checksum string `json:"checksum"`
+		Size     int64  `json:"size"`
 	}
 
-	log.Printf("successfully send chunk to (%s) over the newtwork\n", replicaURL)
-	return nil
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode replica response: %w", err)
+	}
+
+	log.Printf("successfully sent chunk to (%s), checksum=%s\n", replicaURL, result.Checksum)
+	return result.Checksum, nil
 }
 
 func (c *ChunkServer) runHeartBeatCycle() {

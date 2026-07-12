@@ -30,8 +30,9 @@ type FileMetadata struct {
 }
 
 type FileMetaData struct {
-	FileID    string     `json:"file_id"`
+	FileID    string    `json:"file_id"`
 	FileName  string    `json:"file_name"`
+	FileType  string    `json:"file_type"`
 	Size      int64     `json:"size"`
 	ChunkIDs  []ChunkID `json:"chunk_ids"`
 	CreatedAt time.Time `json:"created_at"`
@@ -41,14 +42,21 @@ type FileMetaData struct {
 type ChunkLocation struct {
 	ChunkID     ChunkID    `json:"chunk_id"`
 	Primary     ServerID   `json:"primary_server_name"`
-	PrimaryAddr string            `json:"primary_addr"`
+	PrimaryAddr string     `json:"primary_addr"`
 	Replicas    []ServerID `json:"replica_servers"`
 }
 
 type FileInfoResponse struct {
 	FileID    string          `json:"file_id"`
 	FileName  string          `json:"file_name"`
+	FileType  string          `json:"file_type"`
 	Size      int64           `json:"size"`
 	CreatedAt time.Time       `json:"created_at"`
 	Chunks    []ChunkLocation `json:"chunks"` // ordered — same order the file was written in
+}
+
+
+type ReplicateChunkResponse struct {
+	Checksum string `json:"checksum"`
+	Size     int64  `json:"size"`
 }

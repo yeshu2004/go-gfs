@@ -29,6 +29,8 @@ type PendingChunk struct {
 	ChunkID  models.ChunkID
 	Primary  models.ServerID
 	Replicas []models.ServerID
+	// Checksum string
+	// Size     int64
 }
 
 // Q) Do we have to store the meta data in the master server i.e for the file we would store the
@@ -133,12 +135,12 @@ func (m *MasterServer) fileInfoHandler(rw http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(rw).Encode(models.FileInfoResponse{
 		FileID:    fileMeta.FileID,
 		FileName:  fileMeta.FileName,
+		FileType:  fileMeta.FileType,
 		Size:      fileMeta.Size,
 		CreatedAt: fileMeta.CreatedAt,
 		Chunks:    chunks,
 	})
 }
-
 
 // basically delete pending chunk state in its data
 func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Request) {
@@ -170,6 +172,11 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 	rw.WriteHeader(http.StatusOK)
 }
 
+
+// TODO: after registering the file meta data and returing the chunk size allowed by client over 
+// network, if the user doesn't even upload the file then, we have to actully delete those 
+// file meta data information as they would not be upload, hence a TTL logic would be a better 
+// solution to apply with a 5*60 sec ttl.
 func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(rw, fmt.Sprintf("%v not allowed", r.Method), http.StatusMethodNotAllowed)
@@ -180,6 +187,7 @@ func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http
 	type metaData struct {
 		FileName string `json:"file_name"`
 		Size     int64  `json:"size"`
+		FileType string `json:"file_type"`
 	}
 
 	var fileMetaInfo metaData
@@ -192,6 +200,7 @@ func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http
 	fileInfo := models.FileMetaData{
 		FileID:    fileID,
 		FileName:  fileMetaInfo.FileName,
+		FileType:  fileMetaInfo.FileType,
 		Size:      fileMetaInfo.Size,
 		CreatedAt: time.Now(),
 		Status:    "pending",
@@ -204,6 +213,7 @@ func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http
 	type ChunkSizeReponse struct {
 		FileID       string    `json:"file_id"`
 		FileName     string    `json:"file_name"`
+		FileType     string    `json:"file_type"`
 		Size         int64     `json:"size"`
 		CreatedAt    time.Time `json:"created_at"`
 		Status       string    `json:"status"`
@@ -214,6 +224,7 @@ func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http
 	json.NewEncoder(rw).Encode(ChunkSizeReponse{
 		FileID:       fileInfo.FileID,
 		FileName:     fileInfo.FileName,
+		FileType:     fileInfo.FileType,
 		Size:         fileInfo.Size,
 		CreatedAt:    fileInfo.CreatedAt,
 		Status:       fileInfo.Status,
@@ -260,9 +271,7 @@ func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http
 	})
 }
 
-// TODO: to figure out fix when same file name exists for two diffent files
-// api which response to the client about the chunks available to upload the file
-// response []chunk_serversID
+
 func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(rw, fmt.Sprintf("%v not allowed", r.Method), http.StatusMethodNotAllowed)
@@ -287,12 +296,6 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 	defer m.mu.Unlock()
 
 	// 1. ensure file entry exists
-	// if _, exists := m.fileToChunks[pl.FileName]; !exists {
-	// 	m.fileToChunks[pl.FileName] = []models.ChunkID{}
-	// }
-
-	// m.fileMetaData[].FileName
-
 	meta, ok := m.fileMetaData[pl.FileID]
 	if !ok {
 		http.Error(rw, fmt.Sprintf("file (%s) not found", pl.FileID), http.StatusNotFound)
@@ -300,6 +303,7 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 	}
 	log.Printf("fileSize: %s, fileName: %s", meta.FileID, meta.FileName)
 
+	// DONE:
 	// if user has a file to upload i.e it would have multiple chunks which would have to be uploded
 	// so each file should have a unique name corrosponding to it, and to make it unique every time either
 	// we could version it if user upload the same file again and again or we have gentrate a new uuid or
