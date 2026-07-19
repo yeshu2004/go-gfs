@@ -53,6 +53,7 @@ type FileInfoResponse struct {
 	Size      int64           `json:"size"`
 	CreatedAt time.Time       `json:"created_at"`
 	Chunks    []ChunkLocation `json:"chunks"` // ordered — same order the file was written in
+	Status    string    `json:"status"` // "pending" | "committed" | "failed"
 }
 
 

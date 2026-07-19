@@ -45,6 +45,7 @@ type MasterServer struct {
 
 	fileMetaData map[string]models.FileMetaData
 	// fileToChunks  map[string][]models.ChunkID
+	fileIndex     map[string]models.FileMetaData
 	pendingChunks map[models.ChunkID]PendingChunk // temprory state
 	chunkToServer map[models.ChunkID]PendingChunk // update: after commit to disk
 }
@@ -55,6 +56,7 @@ func NewMasterServer(listenAddr string) *MasterServer {
 		heartbeats:   make(map[models.ServerID]time.Time),
 		chunkMeta:    make(map[models.ServerID]ChunkMeta),
 		fileMetaData: make(map[string]models.FileMetaData),
+		fileIndex:    make(map[string]models.FileMetaData),
 		// fileToChunks:  make(map[string][]models.ChunkID),
 		pendingChunks: make(map[models.ChunkID]PendingChunk),
 		chunkToServer: make(map[models.ChunkID]PendingChunk),
@@ -139,10 +141,11 @@ func (m *MasterServer) fileInfoHandler(rw http.ResponseWriter, r *http.Request) 
 		Size:      fileMeta.Size,
 		CreatedAt: fileMeta.CreatedAt,
 		Chunks:    chunks,
+		Status:    fileMeta.Status,
 	})
 }
 
-// basically delete pending chunk state in its data
+// when successfully commited then basically delete pending chunk state in its data
 func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Request) {
 	chunkID := r.PathValue("chunk_id")
 
@@ -166,16 +169,15 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 	}
 	m.chunkToServer[models.ChunkID(chunkID)] = pending
 
-	// TODO: update the file meta data i.e status = "commited" if successfull
+	// update the file meta data i.e status = "commited" if successfull
 
 	log.Printf("chunk (%s) state updated...", chunkID)
 	rw.WriteHeader(http.StatusOK)
 }
 
-
-// TODO: after registering the file meta data and returing the chunk size allowed by client over 
-// network, if the user doesn't even upload the file then, we have to actully delete those 
-// file meta data information as they would not be upload, hence a TTL logic would be a better 
+// TODO: after registering the file meta data and returing the chunk size allowed by client over
+// network, if the user doesn't even upload the file then, we have to actully delete those
+// file meta data information as they would not be upload, hence a TTL logic would be a better
 // solution to apply with a 5*60 sec ttl.
 func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -207,6 +209,7 @@ func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http
 	}
 
 	m.mu.Lock()
+	m.fileIndex[fileID] = fileInfo // string fileID used as index to find fileMetaData
 	m.fileMetaData[fileID] = fileInfo
 	m.mu.Unlock()
 
@@ -270,7 +273,6 @@ func (m *MasterServer) verfiyAndChunkInfoHandler(rw http.ResponseWriter, r *http
 		ReplicaAddrs: replicaAddrs,
 	})
 }
-
 
 func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

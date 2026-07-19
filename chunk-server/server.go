@@ -144,36 +144,6 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 	}
 	defer file.Close()
 
-	// buff := make([]byte, 512)
-	// if _, err := file.Read(buff); err != nil {
-	// 	http.Error(rw, "failed to read file headers", http.StatusInternalServerError)
-	// 	return
-	// }
-
-	// if _, err := file.Seek(0, io.SeekStart); err != nil {
-	// 	http.Error(rw, "Failed to reset file pointer", http.StatusInternalServerError)
-	// 	return
-	// }
-
-	// fileType := http.DetectContentType(buff)
-	// if fileType != "video/mp4" && fileType != "video/webm" && fileType != "application/octet-stream" {
-	// 	http.Error(rw, "Invalid file format. Only MP4 and WebM are allowed.", http.StatusBadRequest)
-	// 	return
-	// }
-
-	// var ext string
-	// switch fileType {
-	// case "video/mp4":
-	// 	ext = "mp4"
-	// case "video/webm":
-	// 	ext = "webm"
-	// case "application/octet-stream":
-	// 	ext = "bin"
-	// default:
-	// 	http.Error(rw, "Unsupported file type", http.StatusBadRequest)
-	// 	return
-	// }
-
 	fileName := fmt.Sprintf("%s", string(vaildInfo.ChunkID))
 	dstPath := filepath.Join(c.storageDir, fileName)
 	if err := os.MkdirAll(filepath.Dir(dstPath), os.ModePerm); err != nil {
@@ -435,4 +405,9 @@ func sendHeartBeat(masterServerAddr, serverID string, diskSpace int64, diskUsed 
 	url := fmt.Sprintf("http://%s/heartbeat", masterServerAddr)
 	_, err = client.Post(url, "application/json", bytes.NewBuffer(pl))
 	return err
+}
+
+
+func backgroudJobForEmptyFileMetaData(){
+	
 }
