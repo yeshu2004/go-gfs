@@ -36,6 +36,7 @@ type FileMetaData struct {
 	Size      int64     `json:"size"`
 	ChunkIDs  []ChunkID `json:"chunk_ids"`
 	CreatedAt time.Time `json:"created_at"`
+	TotolChunks int64           `json:"total_chunks"`
 	Status    string    `json:"status"` // "pending" | "committed" | "failed"
 }
 
@@ -47,15 +48,19 @@ type ChunkLocation struct {
 }
 
 type FileInfoResponse struct {
-	FileID    string          `json:"file_id"`
-	FileName  string          `json:"file_name"`
-	FileType  string          `json:"file_type"`
-	Size      int64           `json:"size"`
-	CreatedAt time.Time       `json:"created_at"`
-	Chunks    []ChunkLocation `json:"chunks"` // ordered — same order the file was written in
-	Status    string    `json:"status"` // "pending" | "committed" | "failed"
+	FileID      string          `json:"file_id"`
+	FileName    string          `json:"file_name"`
+	FileType    string          `json:"file_type"`
+	Size        int64           `json:"size"`
+	CreatedAt   time.Time       `json:"created_at"`
+	Chunks      []ChunkLocation `json:"chunks"` // ordered — same order the file was written in
+	Status      string          `json:"status"` // "pending" | "committed" | "failed"
 }
 
+type UpdateMetaState struct {
+	FileID  string
+	ChunkID string
+}
 
 type ReplicateChunkResponse struct {
 	Checksum string `json:"checksum"`

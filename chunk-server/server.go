@@ -88,7 +88,7 @@ func (c *ChunkServer) RunServer() {
 	go c.runHeartBeatCycle()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/upload/{chunk_id}", c.uploadChunkToServerHandler)
+	mux.HandleFunc("/upload/{file_id}/{chunk_id}", c.uploadChunkToServerHandler)
 	mux.HandleFunc("/replicate_chunk/{chunk_id}", c.replicateChunkHandler)
 
 	handler := corsMiddleware(mux)
@@ -106,6 +106,12 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 		rw.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	fileID := r.PathValue("file_id")
+	if fileID == "" {
+		http.Error(rw, "missing fileID id", http.StatusBadRequest)
+		return
+	}
+
 
 	chunkID := r.PathValue("chunk_id")
 	if chunkID == "" {
@@ -197,8 +203,8 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 		}
 	}
 
-	// update the master state.....
-	res, err := http.Post(fmt.Sprintf("http://%s/update_file_metadata/%s", c.masterAddr, chunkID), "application/json; charset=utf-8", nil)
+	// update the master state....
+	res, err := http.Post(fmt.Sprintf("http://%s/update_file_metadata/%s/%s", c.masterAddr, fileID, chunkID), "application/json; charset=utf-8", nil)
 	if err != nil {
 		http.Error(rw, fmt.Sprintf("error in updating file chunk metadata: %v", err), http.StatusInternalServerError)
 		return

@@ -84,7 +84,7 @@ func (m *MasterServer) RunServer() error {
 	mux.HandleFunc("/chunk-server", m.allocateChunkHandler)   // WORKING
 	mux.HandleFunc("/max-chunk-size", m.returnMaxChunkSizeHandler)
 	mux.HandleFunc("/chunk-info/{chunk_id}", m.verfiyAndChunkInfoHandler) // WORKING
-	mux.HandleFunc("/update_file_metadata/{chunk_id}", m.updateFileMetaData)
+	mux.HandleFunc("/update_file_metadata/{file_id}/{chunk_id}", m.updateFileMetaData)
 	mux.HandleFunc("/file-info/{file_id}", m.fileInfoHandler) // WORKING
 
 	go m.monitorHeartbeats()
@@ -147,8 +147,19 @@ func (m *MasterServer) fileInfoHandler(rw http.ResponseWriter, r *http.Request) 
 
 // when successfully commited then basically delete pending chunk state in its data
 func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Request) {
-	chunkID := r.PathValue("chunk_id")
+	fileId := r.PathValue("file_id")
+	if fileId == "" {
+		http.Error(rw, "missing file id", http.StatusBadRequest)
+		return
+	}
 
+	meta, exist := m.fileMetaData[fileId]
+	if !exist {
+		http.Error(rw, "file not found", http.StatusNotFound)
+		return
+	}
+
+	chunkID := r.PathValue("chunk_id")
 	if chunkID == "" {
 		http.Error(rw, "missing chunk id", http.StatusBadRequest)
 		return
@@ -169,7 +180,45 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 	}
 	m.chunkToServer[models.ChunkID(chunkID)] = pending
 
+	if len(meta.ChunkIDs) == int(meta.TotolChunks) {
+		log.Printf("(%s) file, all chunks are uploaded, updating the status in file metadata - (commited)\n", fileId)
+		meta.Status = "committed"
+		m.fileMetaData[fileId] = meta
+		m.fileIndex[fileId] = meta
+		log.Printf("(%s) file, status updated - (commited)\n", fileId)
+	}
+
 	// update the file meta data i.e status = "commited" if successfull
+	// found := false
+	// // check weather the chunkID is registerted or not, bcz this api is not exposed publically
+	// // so no issue about it
+	// for _, id := range meta.ChunkIDs {
+	// 	if id == models.ChunkID(chunkID) {
+	// 		found = true
+	// 		break
+	// 	}
+	// }
+	// if !found {
+	// 	// should never happen
+	// 	http.Error(rw, "chunk requested does not belong to file", http.StatusBadRequest)
+	// 	return // if chunkID req is not present in FileMetaData, skip everything below
+	// }
+
+	// allCommitted := true
+	// for _, id := range meta.ChunkIDs {
+	// 	if _, ok := m.chunkToServer[id]; !ok {
+	// 		allCommitted = false
+	// 		break
+	// 	}
+	// }
+
+	// if allCommitted {
+	// 	log.Printf("(%s) file, all chunks are uploaded, updating the status in file metadata - (commited)\n", fileId)
+	// 	meta.Status = "committed"
+	// 	m.fileMetaData[fileId] = meta
+	// 	m.fileIndex[fileId] = meta
+	// 	log.Printf("(%s) file, status updated - (commited)\n", fileId)
+	// }
 
 	log.Printf("chunk (%s) state updated...", chunkID)
 	rw.WriteHeader(http.StatusOK)
@@ -198,14 +247,17 @@ func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http
 		return
 	}
 
+	totalChunks := fileMetaInfo.Size / ChunkSize
+
 	fileID := uuid.NewString()
 	fileInfo := models.FileMetaData{
-		FileID:    fileID,
-		FileName:  fileMetaInfo.FileName,
-		FileType:  fileMetaInfo.FileType,
-		Size:      fileMetaInfo.Size,
-		CreatedAt: time.Now(),
-		Status:    "pending",
+		FileID:      fileID,
+		FileName:    fileMetaInfo.FileName,
+		FileType:    fileMetaInfo.FileType,
+		Size:        fileMetaInfo.Size,
+		CreatedAt:   time.Now(),
+		TotolChunks: totalChunks,
+		Status:      "pending",
 	}
 
 	m.mu.Lock()
