@@ -88,6 +88,7 @@ func (m *MasterServer) RunServer() error {
 	mux.HandleFunc("/file-info/{file_id}", m.fileInfoHandler) // WORKING
 
 	go m.monitorHeartbeats()
+	go m.sweepStaleFileMetaData()
 
 	handler := corsMiddleware(mux)
 
@@ -164,12 +165,18 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 		http.Error(rw, "missing chunk id", http.StatusBadRequest)
 		return
 	}
+
 	log.Println("requested chunk on Maaster Server for updating file MetaData :", chunkID)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	pending := m.pendingChunks[models.ChunkID(chunkID)]
+	pending, ok := m.pendingChunks[models.ChunkID(chunkID)]
+	if !ok {
+		http.Error(rw, "chunk not found in pending state,", http.StatusBadRequest)
+		return
+	}
+
 	delete(m.pendingChunks, models.ChunkID(chunkID))
 	log.Printf("pending chunk (%s) state updated i.e deleted", chunkID)
 
@@ -180,7 +187,15 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 	}
 	m.chunkToServer[models.ChunkID(chunkID)] = pending
 
-	if len(meta.ChunkIDs) == int(meta.TotolChunks) {
+	// cal the commited count
+	commitedCount := 0
+	for _, id := range meta.ChunkIDs {
+		if _, ok := m.chunkToServer[id]; ok { // when succesfully commmited as changed from pendingChunkServer to chunkToServer
+			commitedCount++
+		}
+	}
+
+	if commitedCount == int(meta.TotolChunks) {
 		log.Printf("(%s) file, all chunks are uploaded, updating the status in file metadata - (commited)\n", fileId)
 		meta.Status = "committed"
 		m.fileMetaData[fileId] = meta
@@ -188,43 +203,11 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 		log.Printf("(%s) file, status updated - (commited)\n", fileId)
 	}
 
-	// update the file meta data i.e status = "commited" if successfull
-	// found := false
-	// // check weather the chunkID is registerted or not, bcz this api is not exposed publically
-	// // so no issue about it
-	// for _, id := range meta.ChunkIDs {
-	// 	if id == models.ChunkID(chunkID) {
-	// 		found = true
-	// 		break
-	// 	}
-	// }
-	// if !found {
-	// 	// should never happen
-	// 	http.Error(rw, "chunk requested does not belong to file", http.StatusBadRequest)
-	// 	return // if chunkID req is not present in FileMetaData, skip everything below
-	// }
-
-	// allCommitted := true
-	// for _, id := range meta.ChunkIDs {
-	// 	if _, ok := m.chunkToServer[id]; !ok {
-	// 		allCommitted = false
-	// 		break
-	// 	}
-	// }
-
-	// if allCommitted {
-	// 	log.Printf("(%s) file, all chunks are uploaded, updating the status in file metadata - (commited)\n", fileId)
-	// 	meta.Status = "committed"
-	// 	m.fileMetaData[fileId] = meta
-	// 	m.fileIndex[fileId] = meta
-	// 	log.Printf("(%s) file, status updated - (commited)\n", fileId)
-	// }
-
 	log.Printf("chunk (%s) state updated...", chunkID)
 	rw.WriteHeader(http.StatusOK)
 }
 
-// TODO: after registering the file meta data and returing the chunk size allowed by client over
+// Done: after registering the file meta data and returing the chunk size allowed by client over
 // network, if the user doesn't even upload the file then, we have to actully delete those
 // file meta data information as they would not be upload, hence a TTL logic would be a better
 // solution to apply with a 5*60 sec ttl.
@@ -502,4 +485,20 @@ func (m *MasterServer) monitorHeartbeats() {
 		}
 		m.mu.Unlock()
 	}
+}
+
+func (m *MasterServer) sweepStaleFileMetaData() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    for range ticker.C {
+        m.mu.Lock()
+        for fileID, meta := range m.fileMetaData {
+            if meta.Status == "pending" && time.Since(meta.CreatedAt) > 10*time.Minute {
+                log.Printf("sweeping stale pending file (%s)", fileID)
+                delete(m.fileMetaData, fileID)
+                delete(m.fileIndex, fileID)
+            }
+        }
+        m.mu.Unlock()
+    }
 }

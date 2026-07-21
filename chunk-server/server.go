@@ -413,7 +413,3 @@ func sendHeartBeat(masterServerAddr, serverID string, diskSpace int64, diskUsed 
 	return err
 }
 
-
-func backgroudJobForEmptyFileMetaData(){
-	
-}
