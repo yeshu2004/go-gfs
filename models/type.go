@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type ServerID string
 
@@ -65,4 +68,11 @@ type UpdateMetaState struct {
 type ReplicateChunkResponse struct {
 	Checksum string `json:"checksum"`
 	Size     int64  `json:"size"`
+}
+
+type OpType string
+
+type LogRecord struct {
+	Op   OpType          `json:"op"`
+	Data json.RawMessage `json:"data"`
 }

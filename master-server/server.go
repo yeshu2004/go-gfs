@@ -11,11 +11,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/yeshu2004/gfs/models"
+	"github.com/yeshu2004/gfs/wal"
 )
 
 const (
-	ChunkSize         int64 = 64 * 1024 * 1024
-	ReplicationFactor       = 3
+	ChunkSize         int64         = 64 * 1024 * 1024
+	ReplicationFactor               = 3
+	OpCreateFile      models.OpType = "CREATE_FILE"
+	OpAllocChunk      models.OpType = "ALLOC_CHUNK"
+	OpCommitChunk     models.OpType = "COMMIT_CHUNK"
+	OpStaleDeleteInfo models.OpType = "DELETE_STALE_FILE_INFO"
 )
 
 type ChunkMeta struct {
@@ -39,6 +44,7 @@ type PendingChunk struct {
 
 type MasterServer struct {
 	listenAddr string
+	wal        *wal.WAL
 	heartbeats map[models.ServerID]time.Time
 	chunkMeta  map[models.ServerID]ChunkMeta
 	mu         sync.RWMutex
@@ -50,9 +56,10 @@ type MasterServer struct {
 	chunkToServer map[models.ChunkID]PendingChunk // update: after commit to disk
 }
 
-func NewMasterServer(listenAddr string) *MasterServer {
+func NewMasterServer(listenAddr string, w *wal.WAL) *MasterServer {
 	return &MasterServer{
 		listenAddr:   listenAddr,
+		wal:          w,
 		heartbeats:   make(map[models.ServerID]time.Time),
 		chunkMeta:    make(map[models.ServerID]ChunkMeta),
 		fileMetaData: make(map[string]models.FileMetaData),
@@ -198,6 +205,10 @@ func (m *MasterServer) updateFileMetaData(rw http.ResponseWriter, r *http.Reques
 	if commitedCount == int(meta.TotolChunks) {
 		log.Printf("(%s) file, all chunks are uploaded, updating the status in file metadata - (commited)\n", fileId)
 		meta.Status = "committed"
+		if err := m.appendLog(OpCommitChunk, meta); err != nil{
+			http.Error(rw, fmt.Sprintf("WAL Commit total chunks error: %v", err), http.StatusInternalServerError);
+		}
+
 		m.fileMetaData[fileId] = meta
 		m.fileIndex[fileId] = meta
 		log.Printf("(%s) file, status updated - (commited)\n", fileId)
@@ -244,6 +255,11 @@ func (m *MasterServer) returnMaxChunkSizeHandler(rw http.ResponseWriter, r *http
 	}
 
 	m.mu.Lock()
+	if err := m.appendLog(OpCreateFile, fileInfo); err != nil {
+		m.mu.Unlock()
+		http.Error(rw, fmt.Sprintf("wal write failed: %v", err), http.StatusInternalServerError)
+		return
+	}
 	m.fileIndex[fileID] = fileInfo // string fileID used as index to find fileMetaData
 	m.fileMetaData[fileID] = fileInfo
 	m.mu.Unlock()
@@ -383,7 +399,6 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 		meta := m.chunkMeta[server]
 		meta.ReservedDisk += ChunkSize
 		m.chunkMeta[server] = meta
-
 	}
 
 	// 6. update fileToChunks & chunkToServer
@@ -412,14 +427,21 @@ func (m *MasterServer) allocateChunkHandler(rw http.ResponseWriter, r *http.Requ
 	primaryAddr := m.chunkMeta[primaryServer].Addr
 
 	// 7. retrun back the chunkID & servers to client
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(AllocateChunkResponse{
+	resp := AllocateChunkResponse{
 		ChunkID:     models.ChunkID(chunkId),
 		Primary:     primaryServer,
 		Replicas:    selectedServer[1:],
 		PrimaryAddr: primaryAddr,
 		ChunkSize:   ChunkSize,
-	})
+	}
+
+	if err := m.appendLog(OpAllocChunk, resp); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(resp)
 }
 
 func (m *MasterServer) registerChunkServerHandler(rw http.ResponseWriter, req *http.Request) {
@@ -488,17 +510,42 @@ func (m *MasterServer) monitorHeartbeats() {
 }
 
 func (m *MasterServer) sweepStaleFileMetaData() {
-    ticker := time.NewTicker(30 * time.Second)
-    defer ticker.Stop()
-    for range ticker.C {
-        m.mu.Lock()
-        for fileID, meta := range m.fileMetaData {
-            if meta.Status == "pending" && time.Since(meta.CreatedAt) > 10*time.Minute {
-                log.Printf("sweeping stale pending file (%s)", fileID)
-                delete(m.fileMetaData, fileID)
-                delete(m.fileIndex, fileID)
-            }
-        }
-        m.mu.Unlock()
-    }
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.mu.Lock()
+		for fileID, meta := range m.fileMetaData {
+			if meta.Status == "pending" && time.Since(meta.CreatedAt) > 10*time.Minute {
+				log.Printf("sweeping stale pending file - (%s)", fileID)
+				if err := m.appendLog(OpStaleDeleteInfo, m.fileMetaData[fileID]); err != nil{
+					log.Fatalf("stale file meta data deletion error: %v", err);
+				}
+				delete(m.fileMetaData, fileID)
+				delete(m.fileIndex, fileID)
+				log.Printf("deleted stale meta info of file - (%s)", fileID)
+			}
+		}
+		m.mu.Unlock()
+	}
+}
+
+func (m *MasterServer) appendLog(op models.OpType, payload any) error {
+	py, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	record, err := json.Marshal(models.LogRecord{
+		Op:   op,
+		Data: py,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := m.wal.Write(record); err != nil{
+		return err;
+	}
+	log.Printf("Operation-(%v) appended in log file", op)
+	return nil;
 }

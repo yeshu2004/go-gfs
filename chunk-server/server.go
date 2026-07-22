@@ -132,7 +132,6 @@ func (c *ChunkServer) uploadChunkToServerHandler(rw http.ResponseWriter, r *http
 		http.Error(rw, "master returned error", resp.StatusCode)
 		return
 	}
-
 	var vaildInfo models.VerfiyChunkResp
 	if err := json.NewDecoder(resp.Body).Decode(&vaildInfo); err != nil {
 		http.Error(rw, "chunk decoding error", http.StatusInternalServerError)

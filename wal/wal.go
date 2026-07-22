@@ -48,6 +48,7 @@ func OpenWAL(dir string, shouldFsync bool) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
+	log.Printf("wal dir created: %s", dir);
 
 	files, err := filepath.Glob(filepath.Join(dir, segmentPrefix+"*"))
 	if err != nil {
@@ -62,18 +63,21 @@ func OpenWAL(dir string, shouldFsync bool) (*WAL, error) {
 		if err != nil {
 			return nil, err
 		}
+		log.Printf("last segementID number - %d", lastSegmentID)
 
 		// recover lastSequenceNo by scanning all segments in order.
 		lastSequenceNo, err = recoverLastSequenceIndex(dir, files)
 		if err != nil {
 			return nil, err
 		}
+		log.Printf("last sequence file number - %d", lastSequenceNo)
 	} else {
 		// no segments yet, create the initial one.
 		file, err := createSegmentFile(dir, lastSegmentID)
 		if err != nil {
 			return nil, err
 		}
+		log.Printf("New segment file created: %s", file.Name())
 		if err := file.Close(); err != nil {
 			return nil, err
 		}
